@@ -84,6 +84,8 @@ if(APPLE)
 		src/macActivity.mm
 		include/macGameController.h
 		src/macGameController.mm
+		include/macAudioOutput.h
+		src/macAudioOutput.mm
 	)
 elseif(WIN32)
 	list(APPEND SOURCE_FILES
@@ -98,8 +100,10 @@ add_executable(chiaki WIN32
 )
 target_include_directories(chiaki PRIVATE include)
 if(APPLE)
-	# macActivity.mm (NSProcessInfo activity), macGameController.mm (event-driven controller input)
-	target_link_libraries(chiaki "-framework Foundation" "-framework GameController")
+	# macActivity.mm (NSProcessInfo activity), macGameController.mm (event-driven controller input),
+	# macAudioOutput.mm (AUHAL audio output)
+	target_link_libraries(chiaki "-framework Foundation" "-framework GameController" "-framework AudioToolbox" "-framework CoreAudio")
+	set_source_files_properties(src/macAudioOutput.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 
 add_library(placebo-libav-impl src/libav_impl.c)
