@@ -23,6 +23,7 @@
 #ifdef Q_OS_MACOS
 #include <pthread.h>
 #include <macActivity.h>
+#include <macAudioOutput.h>
 #endif
 
 #define SETSU_UPDATE_INTERVAL_MS 4
@@ -761,6 +762,12 @@ StreamSession::~StreamSession()
 		audio_out_ring_buf.clear();
 		ResetAudioOutRingLocked();
 	}
+#ifdef Q_OS_MACOS
+	// Stops the unit and its 5 s stats log while the session log is still fully usable; the object
+	// itself goes after the session join below, as the audio receive thread may still push into it
+	if(mac_audio_out)
+		mac_audio_out->Stop();
+#endif
 	if(audio_in)
 		SDL_CloseAudioDevice(audio_in);
 #ifdef Q_OS_MACOS
@@ -782,6 +789,10 @@ StreamSession::~StreamSession()
 		chiaki_session_stop(&session);
 		chiaki_session_join(&session);
 	}
+#ifdef Q_OS_MACOS
+	delete mac_audio_out;
+	mac_audio_out = nullptr;
+#endif
 	chiaki_session_fini(&session);
 	chiaki_opus_decoder_fini(&opus_decoder);
 	chiaki_opus_encoder_fini(&opus_encoder);
@@ -1501,12 +1512,31 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 		audio_out_ring_buf.clear();
 		ResetAudioOutRingLocked();
 	}
+	audio_out_sample_size = sizeof(int16_t) * channels;
+
+#ifdef Q_OS_MACOS
+	// Runs while the audio receive thread waits for it (BlockingQueuedConnection), so nothing pushes
+	// into the old output during the swap
+	delete mac_audio_out;
+	mac_audio_out = nullptr;
+	if(qEnvironmentVariable("CHIAKI_AUDIO_BACKEND").compare(QLatin1String("sdl"), Qt::CaseInsensitive) == 0)
+		CHIAKI_LOGI(log.GetChiakiLog(), "[audio] CHIAKI_AUDIO_BACKEND=sdl, using SDL audio output");
+	else
+	{
+		// SDL's CoreAudio backend sits on AudioQueue with several buffers of hidden latency; an AUHAL
+		// unit with a small IO buffer pulls straight from our own jitter buffer instead
+		mac_audio_out = MacAudioOutput::Create(log.GetChiakiLog(), channels, rate, audio_buffer_size,
+			qUtf8Printable(audio_out_device_name));
+		if(mac_audio_out)
+			return;
+		CHIAKI_LOGE(log.GetChiakiLog(), "[audio] CoreAudio output setup failed, falling back to SDL audio output");
+	}
+#endif
 
 	SDL_AudioSpec spec = {0};
 	spec.freq = rate;
 	spec.channels = channels;
 	spec.format = AUDIO_S16SYS;
-	audio_out_sample_size = sizeof(int16_t) * channels;
 	spec.samples = audio_buffer_size / audio_out_sample_size;
 
 	SDL_AudioSpec obtained;
@@ -2074,8 +2104,16 @@ void StreamSession::StopSdeckHaptics()
 
 void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 {
+#ifdef Q_OS_MACOS
+	// The native output keeps being fed at volume 0 (with silence), so a muted stream isn't an underrun
+	if(!audio_out && !mac_audio_out)
+		return;
+	if(!audio_volume && !mac_audio_out)
+		return;
+#else
 	if(!audio_out || !audio_volume)
 		return;
+#endif
 
 	QByteArray buf((int)(samples_count * audio_out_sample_size), 0);
 
@@ -2112,6 +2150,13 @@ void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 	}
 #endif
 queue_audio:
+#ifdef Q_OS_MACOS
+	if(mac_audio_out)
+	{
+		mac_audio_out->Push(reinterpret_cast<const int16_t *>(buf.constData()), samples_count);
+		return;
+	}
+#endif
 	QueueAudioOutData(buf);
 }
 

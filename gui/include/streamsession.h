@@ -26,6 +26,7 @@
 #ifdef __APPLE__
 #include <macMicPermission.h>
 #include <macGameController.h>
+class MacAudioOutput;
 #endif
 
 #include "exception.h"
@@ -295,6 +296,11 @@ class StreamSession : public QObject
 		QThread *audio_out_drain_thread = nullptr;
 		bool audio_out_drain_thread_running = false;
 		bool audio_out_drain_requested = false;
+#ifdef Q_OS_MACOS
+		// Native CoreAudio output (macAudioOutput.h). When set, it replaces audio_out and the ring above;
+		// SDL stays in use for the microphone and haptics.
+		MacAudioOutput *mac_audio_out = nullptr;
+#endif
 		size_t haptics_buffer_size;
 		unsigned int audio_buffer_size;
 		ChiakiHolepunchSession holepunch_session;
