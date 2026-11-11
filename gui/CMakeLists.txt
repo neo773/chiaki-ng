@@ -156,6 +156,8 @@ if(APPLE)
 	target_sources(chiaki PRIVATE include/metalrenderer.h src/metalrenderer.mm)
 	set_source_files_properties(src/metalrenderer.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 	target_link_libraries(chiaki "-framework Metal" "-framework QuartzCore" "-framework CoreVideo" "-framework AppKit")
+	# MetalFX upscaler (macOS 13+); weak so older systems still launch and use the standard upscaler
+	target_link_libraries(chiaki "-weak_framework MetalFX")
 endif()
 
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")

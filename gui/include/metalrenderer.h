@@ -20,6 +20,16 @@ public:
         Zoom
     };
 
+    // How the video is scaled up to the drawable
+    enum class Upscaler {
+        // Catmull-Rom luma, bilinear chroma, in the single composite pass
+        Standard,
+        // YUV -> RGB at source size, then MetalFX spatial upscaling (macOS 13+, Apple GPUs)
+        MetalFX,
+        // Reserved for VideoToolbox super resolution; drawn like Standard until it is wired up
+        AppleSR
+    };
+
     struct RenderParams {
         VideoMode video_mode = VideoMode::Normal;
         // log2 zoom like the libplacebo path; -1 fills the drawable
@@ -57,6 +67,9 @@ public:
     bool attached() const;
     void setDrawableGeometry(const QSize &pixel_size, qreal scale);
     void setVSync(bool enabled);
+    // Any thread; takes effect with the next render. MetalFX falls back to Standard (logged once)
+    // when the GPU or OS doesn't support it.
+    void setUpscaler(Upscaler upscaler);
 
     // Any thread. Takes ownership of frame. The newest frame wins: returns true when an older
     // frame that was never rendered got dropped for it.

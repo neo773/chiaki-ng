@@ -7,6 +7,11 @@
 // One full-screen pass per present: Catmull-Rom luma + bilinear chroma, YUV->RGB with the stream's
 // matrix and range, letterboxing, and the Qt Quick UI blended on top only when it has content.
 //
+// With the MetalFX upscaler, two passes run before that one: YUV->RGB at source size, then the
+// MetalFX spatial scaler to the video's size on screen; the composite pass then only letterboxes,
+// encodes PQ and blends the UI. Scaler and textures are created on the first frame that needs
+// them and again only when a size or format changes.
+//
 // GPU safety: nothing here waits on the GPU without a bound. At most two command buffers are in
 // flight (semaphore waited with a timeout), nextDrawable has the layer's 1 s timeout, and every
 // command buffer's completion handler owns the frames and textures it reads, so the renderer can
@@ -17,6 +22,7 @@
 #import <AppKit/AppKit.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #include <os/signpost.h>
 
@@ -80,6 +86,8 @@ constant uint kFlagTriplanar = 2u;
 constant uint kFlagBicubic = 4u;
 constant uint kFlagOverlay = 8u;
 constant uint kFlagPQ = 16u;
+constant uint kFlagRgbInput = 32u;    // tex_y holds the already upscaled RGB video
+constant uint kFlagLinearVideo = 64u; // that RGB is linear (1.0 = SDR white), output is PQ
 
 struct VOut {
     float4 pos [[position]];
@@ -151,6 +159,37 @@ static float3 bt709_to_bt2020(float3 c)
                   dot(float3(0.0164, 0.0880, 0.8956), c));
 }
 
+// Stream RGB (still in the stream's transfer function) at luma texel coordinate lc
+static float3 video_rgb(constant Params &p, texture2d<float> tex_y, texture2d<float> tex_u,
+                        texture2d<float> tex_v, float2 lc, bool bicubic)
+{
+    constexpr sampler lin(coord::normalized, address::clamp_to_edge, filter::linear);
+    float y = sample_luma(tex_y, lin, lc, p.luma_size, bicubic);
+    float2 cuv = (lc * p.chroma_map.zw + p.chroma_map.xy) * p.chroma_size.zw;
+    float2 c;
+    if ((p.flags & kFlagTriplanar) != 0u)
+        c = float2(tex_u.sample(lin, cuv).r, tex_v.sample(lin, cuv).r);
+    else
+        c = tex_u.sample(lin, cuv).rg;
+    float4 yuv = float4(float3(y, c) * p.bit_scale, 1.0);
+    return saturate(float3(dot(p.m0, yuv), dot(p.m1, yuv), dot(p.m2, yuv)));
+}
+
+// MetalFX path, first pass: the frame as RGB at source size, one fragment per luma texel. With
+// kFlagLinearVideo (PQ output) the result is linear light with 1.0 = SDR reference white, which is
+// what MetalFX's HDR mode expects; otherwise it stays in the stream's (perceptual) encoding.
+fragment float4 chiaki_yuv_to_rgb_fragment(VOut in [[stage_in]],
+                                           constant Params &p [[buffer(0)]],
+                                           texture2d<float> tex_y [[texture(0)]],
+                                           texture2d<float> tex_u [[texture(1)]],
+                                           texture2d<float> tex_v [[texture(2)]])
+{
+    float3 rgb = video_rgb(p, tex_y, tex_u, tex_v, p.src_rect.xy + in.pos.xy, false);
+    if ((p.flags & kFlagLinearVideo) != 0u)
+        rgb = pq_to_linear(rgb) / p.sdr_white;
+    return float4(rgb, 1.0);
+}
+
 fragment float4 chiaki_composite_fragment(VOut in [[stage_in]],
                                           constant Params &p [[buffer(0)]],
                                           texture2d<float> tex_y [[texture(0)]],
@@ -166,16 +205,14 @@ fragment float4 chiaki_composite_fragment(VOut in [[stage_in]],
     if ((p.flags & kFlagVideo) != 0u) {
         float2 rel = (px - p.dst_rect.xy) / p.dst_rect.zw;
         if (all(rel >= 0.0) && all(rel <= 1.0)) {
-            float2 lc = p.src_rect.xy + rel * p.src_rect.zw;
-            float y = sample_luma(tex_y, lin, lc, p.luma_size, (p.flags & kFlagBicubic) != 0u);
-            float2 cuv = (lc * p.chroma_map.zw + p.chroma_map.xy) * p.chroma_size.zw;
-            float2 c;
-            if ((p.flags & kFlagTriplanar) != 0u)
-                c = float2(tex_u.sample(lin, cuv).r, tex_v.sample(lin, cuv).r);
-            else
-                c = tex_u.sample(lin, cuv).rg;
-            float4 yuv = float4(float3(y, c) * p.bit_scale, 1.0);
-            rgb = saturate(float3(dot(p.m0, yuv), dot(p.m1, yuv), dot(p.m2, yuv)));
+            if ((p.flags & kFlagRgbInput) != 0u) {
+                // Already upscaled to dst_rect's (whole-pixel) size: one texel per pixel
+                float3 v = tex_y.sample(lin, rel).rgb;
+                rgb = (p.flags & kFlagLinearVideo) != 0u ? linear_to_pq(max(v, 0.0) * p.sdr_white) : saturate(v);
+            } else {
+                float2 lc = p.src_rect.xy + rel * p.src_rect.zw;
+                rgb = video_rgb(p, tex_y, tex_u, tex_v, lc, (p.flags & kFlagBicubic) != 0u);
+            }
         }
     }
     if ((p.flags & kFlagOverlay) != 0u) {
@@ -212,6 +249,8 @@ enum : uint32_t {
     kFlagBicubic = 4u,
     kFlagOverlay = 8u,
     kFlagPQ = 16u,
+    kFlagRgbInput = 32u,
+    kFlagLinearVideo = 64u,
 };
 
 // Must match Params in the shader
@@ -409,6 +448,33 @@ void computeYuvMatrix(const AVFrame *frame, bool full_range, int depth, float m[
     }
 }
 
+// What the MetalFX scaler and its two textures were made for
+struct FxConfig {
+    NSUInteger in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    MTLPixelFormat format = MTLPixelFormatInvalid;
+    bool hdr = false;
+
+    bool operator==(const FxConfig &o) const
+    {
+        return in_w == o.in_w && in_h == o.in_h && out_w == o.out_w && out_h == o.out_h &&
+            format == o.format && hdr == o.hdr;
+    }
+    bool operator!=(const FxConfig &o) const { return !(*this == o); }
+};
+
+const char *upscalerName(MetalRenderer::Upscaler upscaler)
+{
+    switch (upscaler) {
+    case MetalRenderer::Upscaler::MetalFX:
+        return "metalfx";
+    case MetalRenderer::Upscaler::AppleSR:
+        return "apple_sr";
+    case MetalRenderer::Upscaler::Standard:
+    default:
+        return "standard";
+    }
+}
+
 LayerMode layerModeForFrame(const AVFrame *frame)
 {
     if (!frame)
@@ -428,8 +494,29 @@ struct MetalRenderer::Private {
     __strong id<MTLLibrary> library = nil;
     __strong id<MTLFunction> vertex_fn = nil;
     __strong id<MTLFunction> fragment_fn = nil;
+    __strong id<MTLFunction> convert_fn = nil;
     __strong id<MTLComputePipelineState> overlay_check = nil;
     __strong NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pipelines = nil;
+    // YUV->RGB passes of the MetalFX path, by intermediate pixel format
+    __strong NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *convert_pipelines = nil;
+
+    // Upscaler: requested from any thread, the rest is render thread state
+    std::atomic<int> upscaler{static_cast<int>(MetalRenderer::Upscaler::Standard)};
+    bool fx_supported = false;
+    bool fx_active = false; // the last present used MetalFX
+    bool logged_fx_unsupported = false;
+    bool logged_fx_failure = false;
+    bool logged_fx_created = false;
+    bool logged_apple_sr = false;
+    // id<MTLFXSpatialScaler>, kept as plain id so this file still builds for macOS 12 targets
+    __strong id fx_scaler = nil;
+    __strong id<MTLTexture> fx_input = nil;
+    __strong id<MTLTexture> fx_output = nil;
+    __strong id<MTLRenderPipelineState> fx_convert_pso = nil;
+    __strong MTLRenderPassDescriptor *fx_convert_pass = nil;
+    FxConfig fx_config;
+    // Creation failed for this config; not retried until the config changes
+    FxConfig fx_failed_config;
     __strong dispatch_semaphore_t in_flight = nil;
     __strong id<MTLTexture> dummy_plane = nil;
     __strong id<MTLTexture> dummy_rgba = nil;
@@ -503,6 +590,121 @@ struct MetalRenderer::Private {
         }
         pipelines[key] = pso;
         return pso;
+    }
+
+    id<MTLRenderPipelineState> convertPipelineFor(MTLPixelFormat format)
+    {
+        NSNumber *key = @(static_cast<NSUInteger>(format));
+        id<MTLRenderPipelineState> pso = convert_pipelines[key];
+        if (pso)
+            return pso;
+        MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
+        desc.label = @"chiaki yuv to rgb";
+        desc.vertexFunction = vertex_fn;
+        desc.fragmentFunction = convert_fn;
+        desc.colorAttachments[0].pixelFormat = format;
+        NSError *ns_error = nil;
+        pso = [device newRenderPipelineStateWithDescriptor:desc error:&ns_error];
+        if (!pso) {
+            qCWarning(chiakiGui).noquote() << "Failed to create Metal YUV to RGB pipeline:"
+                                           << QString::fromNSString(ns_error.localizedDescription);
+            return nil;
+        }
+        convert_pipelines[key] = pso;
+        return pso;
+    }
+
+    void releaseFx()
+    {
+        // Command buffers in flight hold their own references
+        fx_scaler = nil;
+        fx_input = nil;
+        fx_output = nil;
+        fx_convert_pso = nil;
+        fx_convert_pass = nil;
+        fx_config = FxConfig();
+    }
+
+    // Makes the MetalFX scaler and its textures match cfg. Only does work when cfg changes.
+    bool ensureFx(const FxConfig &cfg)
+    {
+        if (fx_scaler && fx_config == cfg)
+            return true;
+        if (cfg == fx_failed_config)
+            return false;
+        releaseFx();
+        QString failure = QStringLiteral("MetalFX needs macOS 13");
+        if (@available(macOS 13.0, *)) {
+            failure = QStringLiteral("scaler creation failed");
+            MTLFXSpatialScalerDescriptor *desc = [MTLFXSpatialScalerDescriptor new];
+            desc.inputWidth = cfg.in_w;
+            desc.inputHeight = cfg.in_h;
+            desc.outputWidth = cfg.out_w;
+            desc.outputHeight = cfg.out_h;
+            desc.colorTextureFormat = cfg.format;
+            desc.outputTextureFormat = cfg.format;
+            // PQ is converted to linear light first; SDR (and HLG) stay gamma encoded
+            desc.colorProcessingMode = cfg.hdr ? MTLFXSpatialScalerColorProcessingModeHDR
+                                               : MTLFXSpatialScalerColorProcessingModePerceptual;
+            id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice:device];
+            id<MTLRenderPipelineState> pso = scaler ? convertPipelineFor(cfg.format) : nil;
+            id<MTLTexture> input = nil, output = nil;
+            if (scaler && !pso)
+                failure = QStringLiteral("pipeline creation failed");
+            if (scaler && pso) {
+                failure = QStringLiteral("texture creation failed");
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:cfg.format
+                                                                                              width:cfg.in_w
+                                                                                             height:cfg.in_h
+                                                                                          mipmapped:NO];
+                td.storageMode = MTLStorageModePrivate;
+                td.usage = scaler.colorTextureUsage | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                input = [device newTextureWithDescriptor:td];
+                td.width = cfg.out_w;
+                td.height = cfg.out_h;
+                td.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+                output = [device newTextureWithDescriptor:td];
+            }
+            if (input && output) {
+                input.label = @"chiaki MetalFX input";
+                output.label = @"chiaki MetalFX output";
+                scaler.colorTexture = input;
+                scaler.outputTexture = output;
+                scaler.inputContentWidth = cfg.in_w;
+                scaler.inputContentHeight = cfg.in_h;
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = input;
+                // Every texel is written by the full-screen triangle
+                rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                fx_scaler = scaler;
+                fx_input = input;
+                fx_output = output;
+                fx_convert_pso = pso;
+                fx_convert_pass = rp;
+                fx_config = cfg;
+                const QString msg = QString::asprintf("Metal renderer: MetalFX spatial upscaler %lux%lu -> %lux%lu (%s)",
+                                                      static_cast<unsigned long>(cfg.in_w), static_cast<unsigned long>(cfg.in_h),
+                                                      static_cast<unsigned long>(cfg.out_w), static_cast<unsigned long>(cfg.out_h),
+                                                      cfg.hdr ? "HDR, linear" : "perceptual");
+                // Resizing the window recreates it; only the first one is worth an info line
+                if (logged_fx_created)
+                    qCDebug(chiakiGui).noquote() << msg;
+                else
+                    qCInfo(chiakiGui).noquote() << msg;
+                logged_fx_created = true;
+                return true;
+            }
+        }
+        fx_failed_config = cfg;
+        if (!logged_fx_failure) {
+            logged_fx_failure = true;
+            qCWarning(chiakiGui).noquote() << QString::asprintf(
+                "Metal renderer: MetalFX upscaler unavailable for %lux%lu -> %lux%lu (%s); using the standard upscaler",
+                static_cast<unsigned long>(cfg.in_w), static_cast<unsigned long>(cfg.in_h),
+                static_cast<unsigned long>(cfg.out_w), static_cast<unsigned long>(cfg.out_h), qPrintable(failure));
+        }
+        return false;
     }
 
     id<MTLTexture> makePlaneTexture(MTLPixelFormat format, NSUInteger w, NSUInteger h)
@@ -832,7 +1034,8 @@ struct MetalRenderer::Private {
             qCDebug(chiakiGui).nospace()
                 << "[metal] gpu_us avg=" << (sum / frames) << " max=" << max
                 << " presents=" << frames << " drawable=" << drawable.width() << "x" << drawable.height()
-                << " overlay=" << stats->overlay_has_content.load();
+                << " overlay=" << stats->overlay_has_content.load()
+                << " upscaler=" << (fx_active ? "metalfx" : "standard");
         }
     }
 
@@ -924,11 +1127,15 @@ MetalRenderer *MetalRenderer::create(QString *error)
             return fail(QStringLiteral("Failed to compile Metal shaders: %1").arg(QString::fromNSString(ns_error.localizedDescription)));
         d->vertex_fn = [d->library newFunctionWithName:@"chiaki_fullscreen_vertex"];
         d->fragment_fn = [d->library newFunctionWithName:@"chiaki_composite_fragment"];
+        d->convert_fn = [d->library newFunctionWithName:@"chiaki_yuv_to_rgb_fragment"];
         id<MTLFunction> check_fn = [d->library newFunctionWithName:@"chiaki_overlay_alpha_check"];
-        if (!d->vertex_fn || !d->fragment_fn || !check_fn)
+        if (!d->vertex_fn || !d->fragment_fn || !d->convert_fn || !check_fn)
             return fail(QStringLiteral("Metal shader functions missing"));
 
         d->pipelines = [NSMutableDictionary new];
+        d->convert_pipelines = [NSMutableDictionary new];
+        if (@available(macOS 13.0, *))
+            d->fx_supported = [MTLFXSpatialScalerDescriptor supportsDevice:d->device];
         QString pipeline_error;
         if (!d->pipelineFor(MTLPixelFormatBGRA8Unorm, &pipeline_error) ||
             !d->pipelineFor(MTLPixelFormatBGR10A2Unorm, &pipeline_error))
@@ -1065,6 +1272,13 @@ void MetalRenderer::setVSync(bool enabled)
         return;
     d->layer.displaySyncEnabled = enabled;
     qCInfo(chiakiGui) << "Metal renderer vsync" << enabled;
+}
+
+void MetalRenderer::setUpscaler(Upscaler upscaler)
+{
+    const int prev = d->upscaler.exchange(static_cast<int>(upscaler), std::memory_order_relaxed);
+    if (prev != static_cast<int>(upscaler))
+        qCInfo(chiakiGui) << "Metal renderer upscaler:" << upscalerName(upscaler);
 }
 
 bool MetalRenderer::submitFrame(AVFrame *frame, uint64_t first_packet_us, uint64_t decoded_us)
@@ -1255,6 +1469,8 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
 
         MappedFrame &cur = d->current;
         const bool has_video = cur.frame && cur.planes[0] && cur.planes[1];
+        bool use_fx = false;
+        ShaderParams convert_sp = {};
         if (has_video) {
             const AVFrame *frame = cur.frame;
             const double luma_w = static_cast<double>(cur.planes[0].width);
@@ -1352,9 +1568,51 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
             if (cur.triplanar)
                 sp.flags |= kFlagTriplanar;
             // Catmull-Rom when magnifying; bilinear is fine when shrinking
-            if (dst_w > src_w * 1.001 || dst_h > src_h * 1.001)
+            const bool magnify = dst_w > src_w * 1.001 || dst_h > src_h * 1.001;
+            if (magnify)
                 sp.flags |= kFlagBicubic;
+
+            const auto upscaler = static_cast<Upscaler>(d->upscaler.load(std::memory_order_relaxed));
+            if (upscaler == Upscaler::AppleSR && !d->logged_apple_sr) {
+                d->logged_apple_sr = true;
+                qCInfo(chiakiGui) << "Metal renderer: the apple_sr upscaler isn't available yet; using the standard upscaler";
+            }
+            if (upscaler != Upscaler::MetalFX && d->fx_scaler)
+                d->releaseFx();
+            if (upscaler == Upscaler::MetalFX && magnify) {
+                // The scaler writes whole pixels, so the video goes on a whole-pixel rect
+                const double rx = std::round(dst_x), ry = std::round(dst_y);
+                const double rw = std::round(dst_w), rh = std::round(dst_h);
+                FxConfig cfg;
+                cfg.in_w = static_cast<NSUInteger>(src_w);
+                cfg.in_h = static_cast<NSUInteger>(src_h);
+                cfg.out_w = static_cast<NSUInteger>(rw);
+                cfg.out_h = static_cast<NSUInteger>(rh);
+                cfg.hdr = d->layer_mode == LayerMode::PQ;
+                cfg.format = cfg.hdr || cur.depth > 8 ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
+                // A big zoom would upscale far more than is visible; Catmull-Rom only draws what is
+                const bool sane_size = rw <= 16384.0 && rh <= 16384.0 && rw * rh <= 4.0 * out_w * out_h;
+                if (!d->fx_supported) {
+                    if (!d->logged_fx_unsupported) {
+                        d->logged_fx_unsupported = true;
+                        qCWarning(chiakiGui) << "Metal renderer: MetalFX spatial upscaling isn't supported on this Mac; using the standard upscaler";
+                    }
+                } else if (sane_size && d->ensureFx(cfg)) {
+                    use_fx = true;
+                    sp.dst_rect[0] = static_cast<float>(rx);
+                    sp.dst_rect[1] = static_cast<float>(ry);
+                    sp.dst_rect[2] = static_cast<float>(rw);
+                    sp.dst_rect[3] = static_cast<float>(rh);
+                    // First pass: YUV -> RGB at source size, in the stream's encoding or linear for PQ
+                    convert_sp = sp;
+                    convert_sp.flags = (sp.flags & kFlagTriplanar) | (cfg.hdr ? kFlagLinearVideo : 0u);
+                    convert_sp.src_rect[0] = 0.0f;
+                    convert_sp.src_rect[1] = 0.0f;
+                    sp.flags = kFlagVideo | kFlagRgbInput | (cfg.hdr ? kFlagLinearVideo : 0u);
+                }
+            }
         }
+        d->fx_active = use_fx;
         if (d->layer_mode == LayerMode::PQ)
             sp.flags |= kFlagPQ;
         const bool overlay = d->overlay && d->stats->overlay_has_content.load() != 0;
@@ -1385,6 +1643,25 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
             }
         }
 
+        __strong id hold_fx = nil;
+        if (use_fx) {
+            if (@available(macOS 13.0, *)) {
+                id<MTLRenderCommandEncoder> cenc = [cb renderCommandEncoderWithDescriptor:d->fx_convert_pass];
+                cenc.label = @"chiaki yuv to rgb";
+                [cenc setRenderPipelineState:d->fx_convert_pso];
+                [cenc setFragmentBytes:&convert_sp length:sizeof(convert_sp) atIndex:0];
+                [cenc setFragmentTexture:cur.planes[0] atIndex:0];
+                [cenc setFragmentTexture:cur.planes[1] atIndex:1];
+                [cenc setFragmentTexture:(cur.planes[2] ? cur.planes[2] : d->dummy_plane) atIndex:2];
+                [cenc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [cenc endEncoding];
+                id<MTLFXSpatialScaler> scaler = d->fx_scaler;
+                [scaler encodeToCommandBuffer:cb];
+                // Recreating the scaler mustn't free what this command buffer still runs
+                hold_fx = d->fx_scaler;
+            }
+        }
+
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = target;
         // Every pixel is written by the full-screen triangle
@@ -1394,9 +1671,15 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
         enc.label = @"chiaki composite";
         [enc setRenderPipelineState:pso];
         [enc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
-        [enc setFragmentTexture:(has_video ? cur.planes[0] : d->dummy_plane) atIndex:0];
-        [enc setFragmentTexture:(has_video ? cur.planes[1] : d->dummy_plane) atIndex:1];
-        [enc setFragmentTexture:(has_video && cur.planes[2] ? cur.planes[2] : d->dummy_plane) atIndex:2];
+        if (use_fx) {
+            [enc setFragmentTexture:d->fx_output atIndex:0];
+            [enc setFragmentTexture:d->dummy_plane atIndex:1];
+            [enc setFragmentTexture:d->dummy_plane atIndex:2];
+        } else {
+            [enc setFragmentTexture:(has_video ? cur.planes[0] : d->dummy_plane) atIndex:0];
+            [enc setFragmentTexture:(has_video ? cur.planes[1] : d->dummy_plane) atIndex:1];
+            [enc setFragmentTexture:(has_video && cur.planes[2] ? cur.planes[2] : d->dummy_plane) atIndex:2];
+        }
         [enc setFragmentTexture:(d->overlay ? d->overlay : d->dummy_rgba) atIndex:3];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
@@ -1425,6 +1708,7 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
                     stats->overlay_has_content.store(found ? 1 : 0);
                 }
             }
+            (void)hold_fx;
             AVFrame *frame = hold_frame;
             av_frame_free(&frame);
             if (hold_cv0)
