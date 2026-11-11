@@ -745,7 +745,7 @@ static const QMap<MetalUpscaler, QString> metal_upscaler_values = {
 	{ MetalUpscaler::AppleSR, "apple_sr" },
 };
 
-static const MetalUpscaler metal_upscaler_default = MetalUpscaler::Standard;
+static const MetalUpscaler metal_upscaler_default = MetalUpscaler::MetalFX;
 
 MetalUpscaler Settings::GetMetalUpscaler() const
 {
