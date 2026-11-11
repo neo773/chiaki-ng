@@ -21,6 +21,7 @@ set(HEADER_FILES
 		include/chiaki/audiosender.h
 		include/chiaki/video.h
 		include/chiaki/videoreceiver.h
+		include/chiaki/latencystats.h
 		include/chiaki/frameprocessor.h
 		include/chiaki/packetstats.h
 		include/chiaki/seqnum.h

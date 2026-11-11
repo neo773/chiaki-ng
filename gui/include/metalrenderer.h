@@ -6,6 +6,7 @@
 #include <QSize>
 #include <QString>
 
+#include <cstdint>
 #include <functional>
 
 struct AVFrame;
@@ -59,7 +60,9 @@ public:
 
     // Any thread. Takes ownership of frame. The newest frame wins: returns true when an older
     // frame that was never rendered got dropped for it.
-    bool submitFrame(AVFrame *frame);
+    // first_packet_us / decoded_us (chiaki_time_now_monotonic_us(), 0 if unknown) feed the
+    // [latency] log: when the frame's first network packet arrived and when it was decoded.
+    bool submitFrame(AVFrame *frame, uint64_t first_packet_us = 0, uint64_t decoded_us = 0);
     // Any thread. Drops the pending and the displayed frame; the next render shows black.
     void clearFrames();
     bool hasPendingFrame() const;

@@ -18,6 +18,10 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#include <os/signpost.h>
+
+#include <chiaki/latencystats.h>
+#include <chiaki/time.h>
 
 #include <QDebug>
 #include <QLoggingCategory>
@@ -242,6 +246,23 @@ struct GpuStats {
     // Result of the last UI alpha check: 0 empty, 1 has content (or not checked yet)
     std::atomic<int> overlay_has_content{0};
     std::atomic<uint32_t> overlay_generation{0};
+
+    // [latency] stats, filled by drawable presented handlers (any thread)
+    std::mutex latency_mutex;
+    ChiakiLatencyStats handoff{}; // decoded -> handed to submitFrame
+    ChiakiLatencyStats render{}; // submitFrame -> command buffer commit
+    ChiakiLatencyStats display{}; // commit -> on glass (presentedTime)
+    ChiakiLatencyStats total{}; // first network packet -> on glass
+    std::atomic<uint32_t> dropped_before_display{0}; // superseded by a newer frame before render
+    std::atomic<uint32_t> not_presented{0}; // rendered, but the drawable was never shown
+};
+
+// Per-frame timestamps (chiaki_time_now_monotonic_us(), 0 if unknown) for the [latency] log
+struct FrameTiming {
+    uint64_t first_packet_us = 0;
+    uint64_t decoded_us = 0;
+    uint64_t handoff_us = 0;
+    os_signpost_id_t signpost = OS_SIGNPOST_ID_NULL;
 };
 
 struct MappedFrame {
@@ -433,10 +454,18 @@ struct MetalRenderer::Private {
     // Frame hand-off (any thread)
     mutable std::mutex frame_mutex;
     AVFrame *pending = nullptr;
+    FrameTiming pending_timing;
     std::atomic<bool> clear_requested{false};
+
+    // "render" intervals (submitFrame -> commit) for Instruments' Points of Interest
+    os_log_t signpost_log = os_log_create("chiaki-ng", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
 
     // Render thread
     MappedFrame current;
+    FrameTiming current_timing;
+    // current was mapped but not rendered yet
+    bool current_fresh = false;
+    double last_latency_log_s = 0.0;
     UploadSet upload_ring[kUploadRingSize];
     int upload_index = 0;
     bool logged_unsupported_format = false;
@@ -804,6 +833,41 @@ struct MetalRenderer::Private {
                 << " overlay=" << stats->overlay_has_content.load();
         }
     }
+
+    void endRenderSignpost(const FrameTiming &timing)
+    {
+        if (timing.signpost != OS_SIGNPOST_ID_NULL)
+            os_signpost_interval_end(signpost_log, timing.signpost, "render");
+    }
+
+    void logLatency()
+    {
+        const double now = CACurrentMediaTime();
+        if (last_latency_log_s == 0.0)
+            last_latency_log_s = now;
+        if (now - last_latency_log_s < CHIAKI_LATENCY_STATS_INTERVAL_US / 1e6)
+            return;
+        last_latency_log_s = now;
+        ChiakiLatencySummary s[4];
+        {
+            std::lock_guard<std::mutex> locker(stats->latency_mutex);
+            s[0] = chiaki_latency_stats_summarize(&stats->handoff);
+            s[1] = chiaki_latency_stats_summarize(&stats->render);
+            s[2] = chiaki_latency_stats_summarize(&stats->display);
+            s[3] = chiaki_latency_stats_summarize(&stats->total);
+        }
+        const uint32_t dropped = stats->dropped_before_display.exchange(0);
+        const uint32_t not_presented = stats->not_presented.exchange(0);
+        if (s[2].frames == 0 && dropped == 0 && not_presented == 0)
+            return;
+        qCInfo(chiakiGui).noquote() << QString::asprintf(
+            "[latency] handoff_ms p50=%.2f p99=%.2f max=%.2f | render_ms p50=%.2f p99=%.2f max=%.2f"
+            " | display_ms p50=%.2f p99=%.2f max=%.2f | total_ms p50=%.2f p99=%.2f max=%.2f"
+            " frames=%u dropped_before_display=%u not_presented=%u",
+            s[0].p50_ms, s[0].p99_ms, s[0].max_ms, s[1].p50_ms, s[1].p99_ms, s[1].max_ms,
+            s[2].p50_ms, s[2].p99_ms, s[2].max_ms, s[3].p50_ms, s[3].p99_ms, s[3].max_ms,
+            s[2].frames, dropped, not_presented);
+    }
 };
 
 MetalRenderer::MetalRenderer()
@@ -999,18 +1063,31 @@ void MetalRenderer::setVSync(bool enabled)
     qCInfo(chiakiGui) << "Metal renderer vsync" << enabled;
 }
 
-bool MetalRenderer::submitFrame(AVFrame *frame)
+bool MetalRenderer::submitFrame(AVFrame *frame, uint64_t first_packet_us, uint64_t decoded_us)
 {
     if (!frame)
         return false;
+    FrameTiming timing;
+    timing.first_packet_us = first_packet_us;
+    timing.decoded_us = decoded_us;
+    timing.handoff_us = chiaki_time_now_monotonic_us();
+    if (os_signpost_enabled(d->signpost_log)) {
+        timing.signpost = os_signpost_id_generate(d->signpost_log);
+        os_signpost_interval_begin(d->signpost_log, timing.signpost, "render");
+    }
     AVFrame *dropped = nullptr;
+    FrameTiming dropped_timing;
     {
         std::lock_guard<std::mutex> locker(d->frame_mutex);
         dropped = d->pending;
+        dropped_timing = d->pending_timing;
         d->pending = frame;
+        d->pending_timing = timing;
     }
     if (!dropped)
         return false;
+    d->endRenderSignpost(dropped_timing);
+    d->stats->dropped_before_display.fetch_add(1, std::memory_order_relaxed);
     av_frame_free(&dropped);
     return true;
 }
@@ -1018,11 +1095,15 @@ bool MetalRenderer::submitFrame(AVFrame *frame)
 void MetalRenderer::clearFrames()
 {
     AVFrame *dropped = nullptr;
+    FrameTiming dropped_timing;
     {
         std::lock_guard<std::mutex> locker(d->frame_mutex);
         dropped = d->pending;
+        dropped_timing = d->pending_timing;
         d->pending = nullptr;
     }
+    if (dropped)
+        d->endRenderSignpost(dropped_timing);
     av_frame_free(&dropped);
     d->clear_requested.store(true, std::memory_order_release);
 }
@@ -1095,8 +1176,12 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
         return result;
 
     @autoreleasepool {
-        if (d->clear_requested.exchange(false))
+        if (d->clear_requested.exchange(false)) {
             d->current.reset();
+            if (d->current_fresh)
+                d->endRenderSignpost(d->current_timing);
+            d->current_fresh = false;
+        }
 
         if (dispatch_semaphore_wait(d->in_flight, dispatch_time(DISPATCH_TIME_NOW, kInFlightWaitNs)) != 0) {
             d->noteBackpressure("GPU busy (2 command buffers in flight)");
@@ -1114,12 +1199,25 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
         } slot_guard{d->in_flight};
 
         AVFrame *incoming = nullptr;
+        FrameTiming incoming_timing;
         {
             std::lock_guard<std::mutex> locker(d->frame_mutex);
             std::swap(incoming, d->pending);
+            incoming_timing = d->pending_timing;
         }
-        if (incoming)
-            d->mapFrame(incoming, on_zero_copy_failure);
+        if (incoming) {
+            if (d->mapFrame(incoming, on_zero_copy_failure)) {
+                // A frame mapped by an earlier render that was retried was never shown
+                if (d->current_fresh) {
+                    d->endRenderSignpost(d->current_timing);
+                    d->stats->dropped_before_display.fetch_add(1, std::memory_order_relaxed);
+                }
+                d->current_timing = incoming_timing;
+                d->current_fresh = true;
+            } else {
+                d->endRenderSignpost(incoming_timing);
+            }
+        }
 
         CAMetalLayer *layer = d->layer;
         d->applyLayerMode(layerModeForFrame(d->current.frame));
@@ -1299,8 +1397,6 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
 
-        [cb presentDrawable:drawable];
-
         // The completion handler owns what the GPU reads, so nothing has to outlive it here
         AVFrame *hold_frame = has_video ? av_frame_clone(cur.frame) : nullptr;
         CVMetalTextureRef hold_cv0 = has_video && cur.cv[0] ? static_cast<CVMetalTextureRef>(const_cast<void *>(CFRetain(cur.cv[0]))) : nullptr;
@@ -1333,12 +1429,42 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
                 CFRelease(hold_cv1);
             dispatch_semaphore_signal(sem);
         }];
+
+        // Latency of a newly decoded frame, once it is on glass. presentedTime is in
+        // CACurrentMediaTime() (mach_absolute_time) seconds, which stops during sleep unlike
+        // chiaki_time_now_monotonic_us(), so it is converted as "now minus how long ago".
+        if (has_video && d->current_fresh) {
+            d->current_fresh = false;
+            const FrameTiming timing = d->current_timing;
+            const uint64_t commit_us = chiaki_time_now_monotonic_us();
+            [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+                const CFTimeInterval presented_s = shown.presentedTime;
+                if (presented_s <= 0.0) {
+                    stats->not_presented.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                const uint64_t now_us = chiaki_time_now_monotonic_us();
+                const double ago_us = std::max(0.0, (CACurrentMediaTime() - presented_s) * 1e6);
+                const uint64_t glass_us = now_us - std::min<uint64_t>(now_us, static_cast<uint64_t>(ago_us));
+                std::lock_guard<std::mutex> locker(stats->latency_mutex);
+                if (timing.decoded_us && timing.handoff_us >= timing.decoded_us)
+                    chiaki_latency_stats_add(&stats->handoff, timing.handoff_us - timing.decoded_us);
+                if (commit_us >= timing.handoff_us)
+                    chiaki_latency_stats_add(&stats->render, commit_us - timing.handoff_us);
+                chiaki_latency_stats_add(&stats->display, glass_us >= commit_us ? glass_us - commit_us : 0);
+                if (timing.first_packet_us && glass_us >= timing.first_packet_us)
+                    chiaki_latency_stats_add(&stats->total, glass_us - timing.first_packet_us);
+            }];
+            d->endRenderSignpost(timing);
+        }
+        [cb presentDrawable:drawable];
         slot_guard.armed = false;
         [cb commit];
 
         result.presented = true;
         result.video_presented = has_video;
         d->logStats(QSize(static_cast<int>(out_w), static_cast<int>(out_h)));
+        d->logLatency();
         return result;
     }
 }

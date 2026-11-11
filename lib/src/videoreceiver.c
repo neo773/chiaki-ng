@@ -10,6 +10,20 @@
 // or the IDR frame itself was lost; otherwise the picture would stay frozen
 #define VIDEO_IDR_RETRY_INTERVAL_MS 1000
 
+#if defined(_MSC_VER)
+#define VIDEO_THREAD_LOCAL __declspec(thread)
+#else
+#define VIDEO_THREAD_LOCAL _Thread_local
+#endif
+
+// First packet arrival of the frame passed to the video sample callback, set only during the call
+static VIDEO_THREAD_LOCAL uint64_t sample_first_packet_us = 0;
+
+CHIAKI_EXPORT uint64_t chiaki_video_receiver_current_sample_first_packet_us(void)
+{
+	return sample_first_packet_us;
+}
+
 static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver);
 
 static void add_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
@@ -61,6 +75,9 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
 	video_receiver->waiting_for_idr = false;
 	video_receiver->idr_request_last_ms = 0;
 	chiaki_mutex_init(&video_receiver->frames_lost_mutex, false);
+	video_receiver->frame_first_packet_us = 0;
+	memset(&video_receiver->assemble_stats, 0, sizeof(video_receiver->assemble_stats));
+	video_receiver->assemble_stats_start_us = 0;
 }
 
 CHIAKI_EXPORT void chiaki_video_receiver_fini(ChiakiVideoReceiver *video_receiver)
@@ -222,6 +239,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 		}
 
 		video_receiver->frame_index_cur = frame_index;
+		video_receiver->frame_first_packet_us = chiaki_time_now_monotonic_us();
 		err = chiaki_frame_processor_alloc_frame(&video_receiver->frame_processor, packet);
 		if(err != CHIAKI_ERR_SUCCESS)
 			CHIAKI_LOGW(video_receiver->log, "Video receiver could not allocate frame for packet.");
@@ -240,6 +258,25 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 		if(err != CHIAKI_ERR_SUCCESS)
 			CHIAKI_LOGW(video_receiver->log, "Video receiver could not flush frame.");
 	}
+}
+
+/**
+ * Record first packet -> flush of the frame about to be passed to the decoder,
+ * log the stats every CHIAKI_LATENCY_STATS_INTERVAL_US.
+ */
+static void video_receiver_note_assembled(ChiakiVideoReceiver *video_receiver)
+{
+	uint64_t now_us = chiaki_time_now_monotonic_us();
+	if(video_receiver->frame_first_packet_us && now_us >= video_receiver->frame_first_packet_us)
+		chiaki_latency_stats_add(&video_receiver->assemble_stats, now_us - video_receiver->frame_first_packet_us);
+	if(!video_receiver->assemble_stats_start_us)
+		video_receiver->assemble_stats_start_us = now_us;
+	if(now_us - video_receiver->assemble_stats_start_us < CHIAKI_LATENCY_STATS_INTERVAL_US)
+		return;
+	video_receiver->assemble_stats_start_us = now_us;
+	ChiakiLatencySummary s = chiaki_latency_stats_summarize(&video_receiver->assemble_stats);
+	CHIAKI_LOGI(video_receiver->log, "[latency] assemble_ms p50=%.2f p99=%.2f max=%.2f frames=%u",
+			s.p50_ms, s.p99_ms, s.max_ms, (unsigned int)s.frames);
 }
 
 static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver)
@@ -350,7 +387,10 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 
 	if(succ && video_receiver->session->video_sample_cb)
 	{
+		video_receiver_note_assembled(video_receiver);
+		sample_first_packet_us = video_receiver->frame_first_packet_us;
 		bool cb_succ = video_receiver->session->video_sample_cb(frame, frame_size, video_receiver->frames_lost, recovered, video_receiver->session->video_sample_cb_user);
+		sample_first_packet_us = 0;
 		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
 		video_receiver->frames_lost = 0;
 		chiaki_mutex_unlock(&video_receiver->frames_lost_mutex);

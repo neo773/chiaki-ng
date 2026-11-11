@@ -1,6 +1,7 @@
 
 #include <chiaki/ffmpegdecoder.h>
 #include <chiaki/time.h>
+#include <chiaki/videoreceiver.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixdesc.h>
 #include <limits.h>
@@ -12,11 +13,74 @@
 #if TARGET_OS_OSX
 #define CHIAKI_FFMPEG_DECODER_NATIVE_VT 1
 #include <chiaki/vtdecoder.h>
+#include <os/signpost.h>
 #include <stdlib.h>
 #endif
 #endif
 
 static void *ffmpeg_decoder_thread_func(void *user);
+
+#ifdef CHIAKI_FFMPEG_DECODER_NATIVE_VT
+// "decode" intervals (sample callback -> frame ready) for Instruments' Points of Interest
+static os_log_t ffmpeg_decoder_signpost_log = NULL;
+#endif
+
+/**
+ * Remember when a sample was submitted and when its first packet arrived.
+ * Must be called with queue_mutex held, from the video sample callback.
+ */
+static void ffmpeg_decoder_latency_note_submit(ChiakiFfmpegDecoder *decoder, int64_t pts)
+{
+	ChiakiFfmpegDecoderLatencyEntry *entry = &decoder->latency_ring[decoder->latency_ring_next];
+	decoder->latency_ring_next = (decoder->latency_ring_next + 1) % CHIAKI_FFMPEG_DECODER_LATENCY_RING;
+	entry->pts = pts;
+	entry->submit_us = chiaki_time_now_monotonic_us();
+	entry->first_packet_us = chiaki_video_receiver_current_sample_first_packet_us();
+#ifdef CHIAKI_FFMPEG_DECODER_NATIVE_VT
+	if(ffmpeg_decoder_signpost_log)
+		os_signpost_interval_begin(ffmpeg_decoder_signpost_log, (os_signpost_id_t)(pts + 1), "decode");
+#endif
+}
+
+/**
+ * The decoder output frame, which becomes latest_frame: record submit -> frame ready.
+ * Must be called with queue_mutex held.
+ * @return true if the decode stats are due to be logged (after unlocking), summary is set then
+ */
+static bool ffmpeg_decoder_latency_note_frame(ChiakiFfmpegDecoder *decoder, const AVFrame *frame, ChiakiLatencySummary *summary)
+{
+	uint64_t now_us = chiaki_time_now_monotonic_us();
+	decoder->latest_frame_first_packet_us = 0;
+	decoder->latest_frame_decoded_us = now_us;
+	for(size_t i = 0; frame->pts != AV_NOPTS_VALUE && i < CHIAKI_FFMPEG_DECODER_LATENCY_RING; i++)
+	{
+		ChiakiFfmpegDecoderLatencyEntry *entry = &decoder->latency_ring[i];
+		if(entry->pts != frame->pts)
+			continue;
+		decoder->latest_frame_first_packet_us = entry->first_packet_us;
+		if(now_us >= entry->submit_us)
+			chiaki_latency_stats_add(&decoder->decode_stats, now_us - entry->submit_us);
+		entry->pts = AV_NOPTS_VALUE;
+#ifdef CHIAKI_FFMPEG_DECODER_NATIVE_VT
+		if(ffmpeg_decoder_signpost_log)
+			os_signpost_interval_end(ffmpeg_decoder_signpost_log, (os_signpost_id_t)(frame->pts + 1), "decode");
+#endif
+		break;
+	}
+	if(!decoder->decode_stats_start_us)
+		decoder->decode_stats_start_us = now_us;
+	if(now_us - decoder->decode_stats_start_us < CHIAKI_LATENCY_STATS_INTERVAL_US)
+		return false;
+	decoder->decode_stats_start_us = now_us;
+	*summary = chiaki_latency_stats_summarize(&decoder->decode_stats);
+	return true;
+}
+
+static void ffmpeg_decoder_latency_log(ChiakiFfmpegDecoder *decoder, const ChiakiLatencySummary *s)
+{
+	CHIAKI_LOGI(decoder->log, "[latency] decode_ms p50=%.2f p99=%.2f max=%.2f frames=%u",
+			s->p50_ms, s->p99_ms, s->max_ms, (unsigned int)s->frames);
+}
 
 #ifdef CHIAKI_FFMPEG_DECODER_NATIVE_VT
 static bool ffmpeg_decoder_native_vt_enabled(void)
@@ -112,6 +176,17 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 	decoder->last_frame_format = AV_PIX_FMT_NONE;
 	decoder->vt_decoder = NULL;
 	decoder->vt_last_header = NULL;
+	for(size_t i = 0; i < CHIAKI_FFMPEG_DECODER_LATENCY_RING; i++)
+		decoder->latency_ring[i] = (ChiakiFfmpegDecoderLatencyEntry){ .pts = AV_NOPTS_VALUE };
+	decoder->latency_ring_next = 0;
+	memset(&decoder->decode_stats, 0, sizeof(decoder->decode_stats));
+	decoder->decode_stats_start_us = 0;
+	decoder->latest_frame_first_packet_us = 0;
+	decoder->latest_frame_decoded_us = 0;
+#ifdef CHIAKI_FFMPEG_DECODER_NATIVE_VT
+	if(!ffmpeg_decoder_signpost_log)
+		ffmpeg_decoder_signpost_log = os_log_create("chiaki-ng", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+#endif
 
 	chiaki_mutex_lock(&decoder->mutex);
 	decoder->log = log;
@@ -438,6 +513,7 @@ CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t bu
 		decoder->synthetic_packet_pts += synthetic_duration_pts * (int64_t)frames_lost;
 	packet->pts = decoder->synthetic_packet_pts;
 	packet->dts = decoder->synthetic_packet_pts;
+	ffmpeg_decoder_latency_note_submit(decoder, packet->pts);
 	packet->duration = synthetic_duration_pts;
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 8, 100)
 	packet->time_base = decoder->synthetic_time_base;
@@ -639,8 +715,12 @@ static void ffmpeg_decoder_vt_output(AVFrame *frame, void *user)
 	decoder->frame_pkt_timebase = decoder->synthetic_time_base;
 	decoder->frame_ctx_timebase = decoder->synthetic_time_base;
 	decoder->frame_framerate = decoder->synthetic_framerate;
+	ChiakiLatencySummary latency;
+	bool log_latency = ffmpeg_decoder_latency_note_frame(decoder, frame, &latency);
 	bool stop = decoder->decode_thread_stop;
 	chiaki_mutex_unlock(&decoder->queue_mutex);
+	if(log_latency)
+		ffmpeg_decoder_latency_log(decoder, &latency);
 	if(!stop)
 		decoder->frame_available_cb(decoder, decoder->frame_available_cb_user);
 }
@@ -732,9 +812,13 @@ static void *ffmpeg_decoder_thread_func(void *user)
 		decoder->frame_pkt_timebase = pkt_timebase;
 		decoder->frame_ctx_timebase = ctx_timebase;
 		decoder->frame_framerate = framerate;
+		ChiakiLatencySummary latency;
+		bool log_latency = ffmpeg_decoder_latency_note_frame(decoder, frame, &latency);
 		if(decoder->decode_thread_stop)
 			break;
 		chiaki_mutex_unlock(&decoder->queue_mutex);
+		if(log_latency)
+			ffmpeg_decoder_latency_log(decoder, &latency);
 		decoder->frame_available_cb(decoder, decoder->frame_available_cb_user);
 		chiaki_mutex_lock(&decoder->queue_mutex);
 	}
@@ -761,11 +845,18 @@ CHIAKI_EXPORT ChiakiFfmpegFrame chiaki_ffmpeg_decoder_pull_frame(ChiakiFfmpegDec
 	AVRational pkt_timebase = decoder->frame_pkt_timebase;
 	AVRational ctx_timebase = decoder->frame_ctx_timebase;
 	AVRational framerate = decoder->frame_framerate;
+	uint64_t first_packet_us = decoder->latest_frame_first_packet_us;
+	uint64_t decoded_us = decoder->latest_frame_decoded_us;
 	chiaki_mutex_unlock(&decoder->queue_mutex);
 
 	ChiakiFfmpegFrame frame_plus_stats = {};
 	frame_plus_stats.frame = frame;
 	frame_plus_stats.recovered = recovered;
+	if(frame)
+	{
+		frame_plus_stats.first_packet_us = first_packet_us;
+		frame_plus_stats.decoded_us = decoded_us;
+	}
 	if(frame)
 	{
 		chiaki_ffmpeg_frame_get_timing(

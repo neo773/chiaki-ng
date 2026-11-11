@@ -7873,7 +7873,7 @@ void QmlMainWindow::submitMetalFrame(ChiakiFfmpegFrame frame, int32_t frames_los
     }
     startup_first_real_frame_queued_pending_visibility.storeRelease(1);
     // Latest frame wins: one that was never shown is dropped for the new one
-    if (metal_renderer->submitFrame(frame.frame))
+    if (metal_renderer->submitFrame(frame.frame, frame.first_packet_us, frame.decoded_us))
         dropped_frames_current.fetchAndAddRelaxed(1);
     requestMetalRender();
 #else

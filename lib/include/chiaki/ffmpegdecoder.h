@@ -4,6 +4,7 @@
 #include <chiaki/config.h>
 #include <chiaki/log.h>
 #include <chiaki/thread.h>
+#include <chiaki/latencystats.h>
 
 #include <stdint.h>
 
@@ -26,6 +27,12 @@ struct chiaki_ffmpeg_frame_t
 	double pts;
 	double duration;
 	bool recovered;
+	/**
+	 * chiaki_time_now_monotonic_us() when the first network packet of this frame
+	 * arrived and when it finished decoding, 0 if unknown. Latency instrumentation only.
+	 */
+	uint64_t first_packet_us;
+	uint64_t decoded_us;
 };
 
 /**
@@ -49,6 +56,19 @@ typedef struct chiaki_ffmpeg_decoder_unit_t
 	bool recovered;
 	bool parameter_sets;
 } ChiakiFfmpegDecoderUnit;
+
+/**
+ * Latency instrumentation: submit time and first packet arrival of a sample,
+ * found again by pts when its frame comes out of the decoder.
+ */
+#define CHIAKI_FFMPEG_DECODER_LATENCY_RING 32
+
+typedef struct chiaki_ffmpeg_decoder_latency_entry_t
+{
+	int64_t pts;
+	uint64_t submit_us;
+	uint64_t first_packet_us;
+} ChiakiFfmpegDecoderLatencyEntry;
 
 struct chiaki_ffmpeg_decoder_t
 {
@@ -113,6 +133,14 @@ struct chiaki_ffmpeg_decoder_t
 	 */
 	struct chiaki_vt_decoder_t *vt_decoder;
 	AVPacket *vt_last_header; // decode thread only, replayed to avcodec on fallback
+
+	// Latency instrumentation, protected by queue_mutex
+	ChiakiFfmpegDecoderLatencyEntry latency_ring[CHIAKI_FFMPEG_DECODER_LATENCY_RING];
+	size_t latency_ring_next;
+	ChiakiLatencyStats decode_stats; // submit (sample callback) -> frame ready, includes queue wait
+	uint64_t decode_stats_start_us;
+	uint64_t latest_frame_first_packet_us;
+	uint64_t latest_frame_decoded_us;
 };
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *decoder, ChiakiLog *log,

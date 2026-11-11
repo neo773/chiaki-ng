@@ -10,6 +10,7 @@
 #include "frameprocessor.h"
 #include "bitstream.h"
 #include "thread.h"
+#include "latencystats.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +40,11 @@ typedef struct chiaki_video_receiver_t
 	bool waiting_for_idr;
 	uint64_t idr_request_last_ms; // when the IDR being waited for was last requested
 	ChiakiMutex frames_lost_mutex;
+
+	// Latency instrumentation, Takion receive thread only
+	uint64_t frame_first_packet_us; // arrival of the first packet of frame_index_cur
+	ChiakiLatencyStats assemble_stats; // first packet -> frame flushed (all packets + FEC)
+	uint64_t assemble_stats_start_us;
 } ChiakiVideoReceiver;
 
 CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receiver, struct chiaki_session_t *session, ChiakiPacketStats *packet_stats);
@@ -57,6 +63,13 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 CHIAKI_EXPORT void chiaki_video_receiver_set_waiting_for_idr(ChiakiVideoReceiver *video_receiver, bool waiting_for_idr);
 CHIAKI_EXPORT bool chiaki_video_receiver_get_waiting_for_idr(ChiakiVideoReceiver *video_receiver);
 CHIAKI_EXPORT int32_t chiaki_video_receiver_get_frames_lost_total(ChiakiVideoReceiver *video_receiver);
+
+/**
+ * Only valid inside the session's video sample callback, on the calling thread:
+ * monotonic time (chiaki_time_now_monotonic_us()) at which the first packet of the
+ * frame being delivered arrived. 0 outside of the callback and for stream headers.
+ */
+CHIAKI_EXPORT uint64_t chiaki_video_receiver_current_sample_first_packet_us(void);
 
 static inline ChiakiVideoReceiver *chiaki_video_receiver_new(struct chiaki_session_t *session, ChiakiPacketStats *packet_stats)
 {
