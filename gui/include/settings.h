@@ -75,6 +75,16 @@ enum class RenderBackend {
 	Metal
 };
 
+// How the Metal renderer scales the video up
+enum class MetalUpscaler {
+	// Catmull-Rom
+	Standard,
+	// MetalFX spatial scaler
+	MetalFX,
+	// VideoToolbox super resolution (not offered in the UI yet)
+	AppleSR
+};
+
 enum class WindowType {
 	SelectedResolution,
 	CustomResolution,
@@ -384,6 +394,12 @@ class Settings : public QObject
 
 		RenderBackend GetRenderBackend() const;
 		void SetRenderBackend(RenderBackend backend);
+
+		MetalUpscaler GetMetalUpscaler() const;
+		void SetMetalUpscaler(MetalUpscaler upscaler);
+		static QString MetalUpscalerName(MetalUpscaler upscaler);
+		// standard / metalfx / apple_sr; false for anything else
+		static bool MetalUpscalerFromName(const QString &name, MetalUpscaler *upscaler);
 		// Set while Vulkan starts up and cleared once it has shown a frame, so a launch that
 		// crashed inside the Vulkan driver or a Vulkan layer can be told apart on the next one
 		bool GetVulkanStartupPending() const { return settings.value("settings/vulkan_startup_pending", false).toBool(); }

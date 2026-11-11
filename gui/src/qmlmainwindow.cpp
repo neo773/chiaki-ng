@@ -4906,6 +4906,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
                 qCInfo(chiakiGui) << "Metal renderer: the Frame Queue / frame mixer settings are not supported and are ignored";
             bypass_frame_queue = true;
             qCInfo(chiakiGui) << "Metal renderer: render presets, custom libplacebo options and shaders, and display target overrides are not used";
+            updateMetalUpscaler();
             // A marker left by an earlier Vulkan launch says nothing about Metal
             if (settings->GetVulkanStartupPending()) {
                 settings->SetVulkanStartupPending(false);
@@ -6006,6 +6007,27 @@ void QmlMainWindow::updatePlacebo()
 {
     renderparams_changed = true;
     schedule_frame_mixer_active.storeRelaxed(configuredFrameMixerEnabledForScheduling() ? 1 : 0);
+}
+
+void QmlMainWindow::updateMetalUpscaler()
+{
+#if defined(Q_OS_MACOS)
+    if (!metal_renderer)
+        return;
+    MetalUpscaler upscaler = settings->GetMetalUpscaler();
+    // For quick A/B runs: CHIAKI_UPSCALER=standard|metalfx wins over the setting
+    const QString env = qEnvironmentVariable("CHIAKI_UPSCALER");
+    if (!env.isEmpty()) {
+        MetalUpscaler forced;
+        if (Settings::MetalUpscalerFromName(env, &forced))
+            upscaler = forced;
+        else
+            qCWarning(chiakiGui) << "Ignoring unknown CHIAKI_UPSCALER value" << env;
+    }
+    static_assert(static_cast<int>(MetalUpscaler::AppleSR) == static_cast<int>(MetalRenderer::Upscaler::AppleSR),
+                  "MetalUpscaler and MetalRenderer::Upscaler must match");
+    metal_renderer->setUpscaler(static_cast<MetalRenderer::Upscaler>(static_cast<int>(upscaler)));
+#endif
 }
 
 void QmlMainWindow::updateVSync()

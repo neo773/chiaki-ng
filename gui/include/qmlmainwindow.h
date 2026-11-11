@@ -166,6 +166,8 @@ public slots:
 
     void updatePlacebo();
     void updateVSync();
+    // Metal backend: applies the Upscaler (Metal) setting, unless CHIAKI_UPSCALER overrides it
+    void updateMetalUpscaler();
     void updateVulkanDeferredSwap();
     void show();
     void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us = 0);

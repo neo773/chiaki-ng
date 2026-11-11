@@ -739,6 +739,42 @@ void Settings::SetRenderBackend(RenderBackend backend)
 			    render_backend_values.value(backend, render_backend_values[render_backend_default]));
 }
 
+static const QMap<MetalUpscaler, QString> metal_upscaler_values = {
+	{ MetalUpscaler::Standard, "standard" },
+	{ MetalUpscaler::MetalFX, "metalfx" },
+	{ MetalUpscaler::AppleSR, "apple_sr" },
+};
+
+static const MetalUpscaler metal_upscaler_default = MetalUpscaler::Standard;
+
+MetalUpscaler Settings::GetMetalUpscaler() const
+{
+	auto v = settings.value("settings/metal_upscaler", metal_upscaler_values[metal_upscaler_default]).toString();
+	return metal_upscaler_values.key(v, metal_upscaler_default);
+}
+
+void Settings::SetMetalUpscaler(MetalUpscaler upscaler)
+{
+	settings.setValue("settings/metal_upscaler", metal_upscaler_values.value(upscaler, metal_upscaler_values[metal_upscaler_default]));
+}
+
+QString Settings::MetalUpscalerName(MetalUpscaler upscaler)
+{
+	return metal_upscaler_values.value(upscaler, metal_upscaler_values[metal_upscaler_default]);
+}
+
+bool Settings::MetalUpscalerFromName(const QString &name, MetalUpscaler *upscaler)
+{
+	const QString key = name.trimmed().toLower();
+	for (auto it = metal_upscaler_values.cbegin(); it != metal_upscaler_values.cend(); ++it) {
+		if (it.value() == key) {
+			*upscaler = it.key();
+			return true;
+		}
+	}
+	return false;
+}
+
 void Settings::Sync()
 {
 	settings.sync();

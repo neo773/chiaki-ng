@@ -697,6 +697,26 @@ bool QmlSettings::metalRendererAvailable() const
 #endif
 }
 
+int QmlSettings::metalUpscaler() const
+{
+    return static_cast<int>(settings->GetMetalUpscaler());
+}
+
+void QmlSettings::setMetalUpscaler(int upscaler)
+{
+    // apple_sr is reserved but not offered yet
+    if (upscaler < static_cast<int>(MetalUpscaler::Standard) ||
+        upscaler > static_cast<int>(MetalUpscaler::MetalFX)) {
+        qWarning() << "Ignoring invalid Metal upscaler value:" << upscaler;
+        return;
+    }
+    const auto next = static_cast<MetalUpscaler>(upscaler);
+    if (settings->GetMetalUpscaler() == next)
+        return;
+    settings->SetMetalUpscaler(next);
+    emit metalUpscalerChanged();
+}
+
 bool QmlSettings::restartApplication()
 {
     settings->Sync();
@@ -1948,6 +1968,7 @@ void QmlSettings::refreshAllKeys()
     emit sZoomFactorChanged();
     emit videoPresetChanged();
     emit rendererBackendChanged();
+    emit metalUpscalerChanged();
     emit vulkanDeferredSwapChanged();
     emit autoConnectMacChanged();
     emit audioDevicesChanged();

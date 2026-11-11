@@ -1027,6 +1027,27 @@ DialogView {
 
                     Label {
                         Layout.alignment: Qt.AlignRight
+                        text: qsTr("Upscaler (Metal):")
+                        visible: Chiaki.settings.rendererBackend === 2
+                    }
+
+                    C.ComboBox {
+                        Layout.preferredWidth: 400
+                        visible: Chiaki.settings.rendererBackend === 2
+                        // Index = setting value; apple_sr (2) isn't offered yet and shows as Standard
+                        model: [qsTr("Standard (Catmull-Rom)"), qsTr("MetalFX")]
+                        currentIndex: Chiaki.settings.metalUpscaler === 1 ? 1 : 0
+                        onActivated: (index) => Chiaki.settings.metalUpscaler = index
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
+                        text: qsTr("(Standard)")
+                        visible: Chiaki.settings.rendererBackend === 2
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
                         text: qsTr("Vulkan Deferred Swap:")
                         visible: Chiaki.settings.rendererBackend == 0
                     }

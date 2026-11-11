@@ -61,6 +61,7 @@ class QmlSettings : public QObject
     Q_PROPERTY(int videoPreset READ videoPreset WRITE setVideoPreset NOTIFY videoPresetChanged)
     Q_PROPERTY(int rendererBackend READ rendererBackend WRITE setRendererBackend NOTIFY rendererBackendChanged)
     Q_PROPERTY(bool metalRendererAvailable READ metalRendererAvailable CONSTANT)
+    Q_PROPERTY(int metalUpscaler READ metalUpscaler WRITE setMetalUpscaler NOTIFY metalUpscalerChanged)
     Q_PROPERTY(float sZoomFactor READ sZoomFactor WRITE setSZoomFactor NOTIFY sZoomFactorChanged)
     Q_PROPERTY(int packetLossReportedMax READ packetLossReportedMax WRITE setPacketLossReportedMax NOTIFY packetLossReportedMaxChanged)
     Q_PROPERTY(QString autoConnectMac READ autoConnectMac WRITE setAutoConnectMac NOTIFY autoConnectMacChanged)
@@ -320,6 +321,8 @@ public:
     int rendererBackend() const;
     void setRendererBackend(int backend);
     bool metalRendererAvailable() const;
+    int metalUpscaler() const;
+    void setMetalUpscaler(int upscaler);
     Q_INVOKABLE bool restartApplication();
 
     QString autoConnectMac() const;
@@ -675,6 +678,7 @@ signals:
     void sZoomFactorChanged();
     void videoPresetChanged();
     void rendererBackendChanged();
+    void metalUpscalerChanged();
     void autoConnectMacChanged();
     void audioDevicesChanged();
     void registeredHostsChanged();

@@ -324,6 +324,11 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
             &QmlMainWindow::updateVSync,
             Qt::QueuedConnection);
     connect(settings_qml,
+            &QmlSettings::metalUpscalerChanged,
+            window,
+            &QmlMainWindow::updateMetalUpscaler,
+            Qt::QueuedConnection);
+    connect(settings_qml,
             &QmlSettings::vulkanDeferredSwapChanged,
             window,
             &QmlMainWindow::updateVulkanDeferredSwap,
