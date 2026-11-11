@@ -41,6 +41,8 @@ struct chiaki_ffmpeg_frame_t
  */
 #define CHIAKI_FFMPEG_DECODER_QUEUE_CAPACITY 16
 
+struct chiaki_vt_decoder_t;
+
 typedef struct chiaki_ffmpeg_decoder_unit_t
 {
 	AVPacket *packet;
@@ -101,6 +103,16 @@ struct chiaki_ffmpeg_decoder_t
 	AVRational frame_ctx_timebase;
 	AVRational frame_framerate;
 	bool has_b_frames_logged; // only accessed by the decode thread
+	int last_frame_format; // enum AVPixelFormat of the last decoded frame, decode thread only
+
+	/**
+	 * Native VideoToolbox backend (macOS), used instead of avcodec when the
+	 * "videotoolbox" hw decoder is requested. NULL when avcodec decodes.
+	 * Environment overrides: CHIAKI_VT_DECODER=ffmpeg uses FFmpeg's videotoolbox
+	 * hwaccel instead, CHIAKI_VT_ASYNC=1 enables asynchronous decompression.
+	 */
+	struct chiaki_vt_decoder_t *vt_decoder;
+	AVPacket *vt_last_header; // decode thread only, replayed to avcodec on fallback
 };
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *decoder, ChiakiLog *log,
