@@ -11,6 +11,8 @@ Window {
 
     property bool open: false
     property bool closing: false
+    // The libplacebo render presets don't apply to the Metal renderer, so their buttons are hidden
+    readonly property bool metalRenderer: Chiaki.window.runtimeRendererBackend === 2
 
     signal closeRequested()
     signal displaySettingsRequested()
@@ -225,6 +227,7 @@ Window {
 
             ToolButton {
                 id: defaultButton
+                visible: !streamMenuWindow.metalRenderer
                 text: qsTr("Default")
                 padding: 10
                 checkable: true
@@ -240,12 +243,14 @@ Window {
             }
 
             ToolSeparator {
+                visible: !streamMenuWindow.metalRenderer
                 Layout.leftMargin: -10
                 Layout.rightMargin: -10
             }
 
             ToolButton {
                 id: highQualityButton
+                visible: !streamMenuWindow.metalRenderer
                 text: qsTr("High Quality")
                 padding: 10
                 checkable: true
@@ -262,6 +267,7 @@ Window {
 
             ToolButton {
                 id: highQualitySpatialButton
+                visible: !streamMenuWindow.metalRenderer
                 text: qsTr("HQ + Spatial")
                 padding: 10
                 checkable: true
@@ -278,6 +284,7 @@ Window {
 
             ToolButton {
                 id: highQualityAdvancedSpatialButton
+                visible: !streamMenuWindow.metalRenderer
                 text: qsTr("HQ + Adv Spatial")
                 padding: 10
                 checkable: true
@@ -293,12 +300,14 @@ Window {
             }
 
             ToolSeparator {
+                visible: !streamMenuWindow.metalRenderer
                 Layout.leftMargin: -10
                 Layout.rightMargin: -10
             }
 
             ToolButton {
                 id: customButton
+                visible: !streamMenuWindow.metalRenderer
                 text: qsTr("Custom")
                 Layout.rightMargin: 40
                 padding: 10
@@ -333,7 +342,7 @@ Window {
                 icon.source: "qrc:/icons/settings-20px.svg"
                 padding: 10
                 checkable: false
-                visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
+                visible: !streamMenuWindow.metalRenderer && Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
                 onClicked: streamMenuWindow.placeboSettingsRequested()
                 KeyNavigation.left: displaySettingsButton
                 Keys.onReturnPressed: clicked()

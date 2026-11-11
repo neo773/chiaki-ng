@@ -16,6 +16,8 @@ Item {
     property bool sessionLoading: true
     property list<Item> restoreFocusItems
     readonly property bool useSeparateMenuWindow: Chiaki.window.runtimeRendererBackend === 1
+    // The libplacebo render presets don't apply to the Metal renderer, so their buttons are hidden
+    readonly property bool metalRenderer: Chiaki.window.runtimeRendererBackend === 2
     readonly property int streamMenuHeight: 200
     readonly property bool streamStatsVisible: Chiaki.settings.showStreamStats && Chiaki.session && !(menuController.open || menuController.closing) && !sessionLoading && !sessionError && !(Chiaki.settings.audioVideoDisabled & 0x02)
     property int separateMenuX: 0
@@ -624,6 +626,7 @@ Item {
 
             ToolButton {
                 id: defaultButton
+                visible: !view.metalRenderer
                 text: qsTr("Default")
                 padding: 10
                 checkable: true
@@ -639,12 +642,14 @@ Item {
             }
 
             ToolSeparator {
+                visible: !view.metalRenderer
                 Layout.leftMargin: -10
                 Layout.rightMargin: -10
             }
 
             ToolButton {
                 id: highQualityButton
+                visible: !view.metalRenderer
                 text: qsTr("High Quality")
                 padding: 10
                 checkable: true
@@ -661,6 +666,7 @@ Item {
 
             ToolButton {
                 id: highQualitySpatialButton
+                visible: !view.metalRenderer
                 text: qsTr("HQ + Spatial")
                 padding: 10
                 checkable: true
@@ -677,6 +683,7 @@ Item {
 
             ToolButton {
                 id: highQualityAdvancedSpatialButton
+                visible: !view.metalRenderer
                 text: qsTr("HQ + Adv Spatial")
                 padding: 10
                 checkable: true
@@ -692,12 +699,14 @@ Item {
             }
 
             ToolSeparator {
+                visible: !view.metalRenderer
                 Layout.leftMargin: -10
                 Layout.rightMargin: -10
             }
 
             ToolButton {
                 id: customButton
+                visible: !view.metalRenderer
                 text: qsTr("Custom")
                 Layout.rightMargin: 40
                 padding: 10
@@ -742,7 +751,7 @@ Item {
                 checkable: false
                 onClicked: root.openPlaceboSettings()
                 KeyNavigation.left: displaySettingsButton
-                visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
+                visible: !view.metalRenderer && Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
                 Keys.onReturnPressed: {
                     menuController.close();
                     clicked();
