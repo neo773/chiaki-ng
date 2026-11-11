@@ -13,6 +13,10 @@
 #include <switch.h>
 #endif
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 #if defined(__ANDROID__)
 struct chiaki_timedjoin_ctx
 {
@@ -83,7 +87,20 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_thread_create(ChiakiThread *thread, ChiakiT
 	if(get_thread_limit() <= 1)
 		return CHIAKI_ERR_THREAD;
 #endif
+#ifdef __APPLE__
+	// Chiaki threads (network receive/send, decode, ...) sit on the latency
+	// critical path of the stream, so keep them off the efficiency cores and
+	// at the same scheduling class as the UI/render thread.
+	pthread_attr_t attr;
+	int r = pthread_attr_init(&attr);
+	if(r != 0)
+		return CHIAKI_ERR_THREAD;
+	pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+	r = pthread_create(&thread->thread, &attr, func, arg);
+	pthread_attr_destroy(&attr);
+#else
 	int r = pthread_create(&thread->thread, NULL, func, arg);
+#endif
 	if(r != 0)
 		return CHIAKI_ERR_THREAD;
 #endif
@@ -123,6 +140,17 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_thread_set_name(ChiakiThread *thread, const
 	int r = pthread_setname_np(thread->thread, name);
 	if(r != 0)
 		return CHIAKI_ERR_THREAD;
+#elif defined(__APPLE__)
+	// Darwin can only name the calling thread. When called from another thread
+	// (the usual pattern right after chiaki_thread_create()), the thread names
+	// itself in chiaki_thread_set_affinity(), which every Chiaki thread calls
+	// on entry.
+	if(pthread_equal(pthread_self(), thread->thread))
+	{
+		int r = pthread_setname_np(name);
+		if(r != 0)
+			return CHIAKI_ERR_THREAD;
+	}
 #else
 	(void)thread;
 	(void)name;
@@ -134,8 +162,38 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_thread_set_name(ChiakiThread *thread, const
 static ChiakiThreadAffinityFunc g_affinity_cb = NULL;
 static void *g_affinity_cb_user = NULL;
 
+#ifdef __APPLE__
+static const char *thread_name_string(ChiakiThreadName name)
+{
+	switch(name)
+	{
+		case CHIAKI_THREAD_NAME_CTRL: return "Chiaki Ctrl";
+		case CHIAKI_THREAD_NAME_CONGESTION: return "Chiaki Congestion Control";
+		case CHIAKI_THREAD_NAME_DISCOVERY: return "Chiaki Discovery";
+		case CHIAKI_THREAD_NAME_DISCOVERY_SVC: return "Chiaki Discovery Service";
+		case CHIAKI_THREAD_NAME_TAKION: return "Chiaki Takion";
+		case CHIAKI_THREAD_NAME_TAKION_SEND: return "Chiaki Takion Send Buffer";
+		case CHIAKI_THREAD_NAME_RUDP_SEND: return "Chiaki Rudp Send Buffer";
+		case CHIAKI_THREAD_NAME_HOLEPUNCH: return "Chiaki Holepunch WS";
+		case CHIAKI_THREAD_NAME_FEEDBACK: return "Chiaki Feedback Sender";
+		case CHIAKI_THREAD_NAME_SESSION: return "Chiaki Session";
+		case CHIAKI_THREAD_NAME_REGIST: return "Chiaki Regist";
+		case CHIAKI_THREAD_NAME_GKCRYPT: return "Chiaki GKCrypt";
+		case CHIAKI_THREAD_NAME_DECODER: return "Chiaki Decoder";
+	}
+	return NULL;
+}
+#endif
+
 CHIAKI_EXPORT void chiaki_thread_set_affinity(ChiakiThreadName name)
 {
+#ifdef __APPLE__
+	// Called by every Chiaki thread on entry, so this is where threads get
+	// named on Darwin (see chiaki_thread_set_name()).
+	const char *name_str = thread_name_string(name);
+	if(name_str)
+		pthread_setname_np(name_str);
+#endif
 	if(g_affinity_cb)
 		g_affinity_cb(name, g_affinity_cb_user);
 }
