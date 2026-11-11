@@ -6415,6 +6415,19 @@ void QmlMainWindow::sync()
         return;
     const qint64 sync_quick_render_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     quick_need_render.storeRelaxed(quick_render->sync() ? 1 : 0);
+#if defined(Q_OS_MACOS)
+    // QRhiMetal's frame command buffer and encoders are autoreleased: beginFrame, render and
+    // endFrame must run inside one autorelease pool. Leaving the frame open past this pool
+    // let a later render use a freed command buffer (crash in QRhiMetal::beginPass)
+    if (render_backend == RenderBackend::Metal) {
+        if (quick_need_render.fetchAndStoreRelaxed(0) != 0) {
+            quick_render->render();
+            if (metal_renderer)
+                metal_renderer->noteOverlayRendered();
+        }
+        endFrame();
+    }
+#endif
     const qint64 sync_quick_render_end_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     if (sync_quick_render_end_us >= sync_quick_render_begin_us) {
         const qint64 sync_quick_render_us = sync_quick_render_end_us - sync_quick_render_begin_us;
