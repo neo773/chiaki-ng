@@ -104,6 +104,29 @@ static void video_receiver_retry_idr_request(ChiakiVideoReceiver *video_receiver
 		CHIAKI_LOGW(video_receiver->log, "Still waiting for IDR frame and the request could not be sent again: %s", chiaki_error_string(err));
 }
 
+#if !defined(__ANDROID__) && !defined(__SWITCH__)
+/**
+ * The video sample callback rejected a frame: request an IDR frame and skip
+ * P-frames until it arrives (or retry the pending request if it is due).
+ */
+static void video_receiver_request_idr_after_sample_failure(ChiakiVideoReceiver *video_receiver)
+{
+	if(chiaki_video_receiver_get_waiting_for_idr(video_receiver))
+	{
+		video_receiver_retry_idr_request(video_receiver);
+		return;
+	}
+	ChiakiErrorCode err = stream_connection_send_idr_request(&video_receiver->session->stream_connection);
+	if(err == CHIAKI_ERR_SUCCESS)
+	{
+		chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
+		CHIAKI_LOGI(video_receiver->log, "Video callback rejected a frame, waiting for IDR frame");
+	}
+	else
+		CHIAKI_LOGW(video_receiver->log, "Video callback rejected a frame and IDR request could not be sent: %s", chiaki_error_string(err));
+}
+#endif
+
 CHIAKI_EXPORT bool chiaki_video_receiver_get_waiting_for_idr(ChiakiVideoReceiver *video_receiver)
 {
 	bool waiting_for_idr;
@@ -335,6 +358,12 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 		{
 			succ = false;
 			CHIAKI_LOGW(video_receiver->log, "Video callback did not process frame successfully.");
+#if !defined(__ANDROID__) && !defined(__SWITCH__)
+			// The FFmpeg decoder (desktop GUI) rejects a frame when its decode queue
+			// overflowed and it dropped queued frames, so the reference chain is broken:
+			// skip P-frames and request an IDR, like after a FEC failure.
+			video_receiver_request_idr_after_sample_failure(video_receiver);
+#endif
 		}
 		else
 		{

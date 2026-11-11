@@ -28,9 +28,33 @@ struct chiaki_ffmpeg_frame_t
 	bool recovered;
 };
 
+/**
+ * Maximum number of access units (frames) waiting for the decode thread.
+ * When a new frame arrives while this many are queued, all queued frames are
+ * dropped and the video sample callback returns false so that an IDR frame
+ * is requested (P-frames can not be dropped selectively).
+ */
+#define CHIAKI_FFMPEG_DECODER_QUEUE_MAX_FRAMES 8
+/**
+ * Ring buffer capacity. Larger than CHIAKI_FFMPEG_DECODER_QUEUE_MAX_FRAMES so
+ * parameter set units (stream headers) are never dropped.
+ */
+#define CHIAKI_FFMPEG_DECODER_QUEUE_CAPACITY 16
+
+typedef struct chiaki_ffmpeg_decoder_unit_t
+{
+	AVPacket *packet;
+	bool recovered;
+	bool parameter_sets;
+} ChiakiFfmpegDecoderUnit;
+
 struct chiaki_ffmpeg_decoder_t
 {
 	ChiakiLog *log;
+	/**
+	 * Protects codec_context. Only held around avcodec calls,
+	 * never while waiting for packets.
+	 */
 	ChiakiMutex mutex;
 	const AVCodec *av_codec;
 	AVCodecContext *codec_context;
@@ -50,6 +74,33 @@ struct chiaki_ffmpeg_decoder_t
 	double synthetic_candidate_duration_us;
 	uint64_t synthetic_last_sample_time_us;
 	uint8_t synthetic_candidate_count;
+
+	/**
+	 * Decode thread: the video sample callback (Takion receive thread) only
+	 * queues access units, the decode thread runs avcodec and stores the newest
+	 * decoded frame for chiaki_ffmpeg_decoder_pull_frame().
+	 */
+	ChiakiThread decode_thread;
+	/**
+	 * Protects the queue, latest_frame, frames_lost, frame_recovered,
+	 * the synthetic_* timing state and the frame_* timing snapshot.
+	 */
+	ChiakiMutex queue_mutex;
+	ChiakiCond queue_cond;
+	bool decode_thread_stop;
+	/**
+	 * Set by the decode thread when avcodec failed on a frame. The next video
+	 * sample callback clears it and returns false so that an IDR is requested.
+	 */
+	bool decode_error;
+	ChiakiFfmpegDecoderUnit queue[CHIAKI_FFMPEG_DECODER_QUEUE_CAPACITY];
+	size_t queue_head;
+	size_t queue_count;
+	AVFrame *latest_frame;
+	AVRational frame_pkt_timebase;
+	AVRational frame_ctx_timebase;
+	AVRational frame_framerate;
+	bool has_b_frames_logged; // only accessed by the decode thread
 };
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *decoder, ChiakiLog *log,
