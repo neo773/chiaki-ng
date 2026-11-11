@@ -717,6 +717,36 @@ Item {
                     Chiaki.settings.videoPreset = ChiakiWindow.VideoPreset.Custom
                 }
                 KeyNavigation.left: highQualityAdvancedSpatialButton
+                KeyNavigation.right: upscalerStandardButton
+                Keys.onReturnPressed: toggled()
+                Keys.onEscapePressed: menuController.close()
+            }
+
+            // Metal only: switch the upscaler live during a stream to compare them in game
+            ToolButton {
+                id: upscalerStandardButton
+                visible: view.metalRenderer
+                text: qsTr("Standard")
+                padding: 10
+                checkable: true
+                checked: Chiaki.settings.metalUpscaler === 0
+                onToggled: Chiaki.settings.metalUpscaler = 0
+                KeyNavigation.left: customButton
+                KeyNavigation.right: upscalerMetalFXButton
+                Keys.onReturnPressed: toggled()
+                Keys.onEscapePressed: menuController.close()
+            }
+
+            ToolButton {
+                id: upscalerMetalFXButton
+                visible: view.metalRenderer
+                text: qsTr("MetalFX")
+                Layout.rightMargin: 40
+                padding: 10
+                checkable: true
+                checked: Chiaki.settings.metalUpscaler === 1
+                onToggled: Chiaki.settings.metalUpscaler = 1
+                KeyNavigation.left: upscalerStandardButton
                 KeyNavigation.right: displaySettingsButton
                 Keys.onReturnPressed: toggled()
                 Keys.onEscapePressed: menuController.close()
@@ -729,7 +759,7 @@ Item {
                 checkable: false
                 icon.source: "qrc:/icons/settings-20px.svg";
                 onClicked: root.openDisplaySettings()
-                KeyNavigation.left: customButton
+                KeyNavigation.left: upscalerMetalFXButton
                 KeyNavigation.right: {
                     if(Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom)
                         placeboSettingsButton;
