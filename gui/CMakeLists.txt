@@ -80,6 +80,10 @@ if(APPLE)
 		src/macMicPermission.m
 		include/macWakeSleep.h
 		src/macWakeSleep.cpp
+		include/macActivity.h
+		src/macActivity.mm
+		include/macGameController.h
+		src/macGameController.mm
 	)
 elseif(WIN32)
 	list(APPEND SOURCE_FILES
@@ -93,6 +97,10 @@ add_executable(chiaki WIN32
 		${SOURCE_FILES}
 )
 target_include_directories(chiaki PRIVATE include)
+if(APPLE)
+	# macActivity.mm (NSProcessInfo activity), macGameController.mm (event-driven controller input)
+	target_link_libraries(chiaki "-framework Foundation" "-framework GameController")
+endif()
 
 add_library(placebo-libav-impl src/libav_impl.c)
 target_link_libraries(placebo-libav-impl PkgConfig::LIBPLACEBO FFMPEG::avcodec FFMPEG::avutil FFMPEG::avformat)

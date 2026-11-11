@@ -647,7 +647,14 @@ void Settings::SetCodecRemotePS5(ChiakiCodec codec)
 
 unsigned int Settings::GetAudioBufferSizeDefault() const
 {
+#ifdef Q_OS_MACOS
+	// 480 frames = 10 ms at 48 kHz stereo S16. SDL3's CoreAudio backend keeps 3 AudioQueue buffers of
+	// this size, or 2x ceil(15 ms / size) when a buffer is under 15 ms, so this gives 4 x 10 ms = 40 ms
+	// of device buffering instead of 3 x 50 ms = 150 ms with the 9600 default.
+	return 1920;
+#else
 	return 9600;
+#endif
 }
 
 unsigned int Settings::GetAudioBufferSizeRaw() const

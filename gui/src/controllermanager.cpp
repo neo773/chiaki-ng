@@ -128,7 +128,12 @@ static QSet<QPair<uint16_t, uint16_t>> chiaki_steam_virtual_controller_ids({
 
 static ControllerManager *instance = nullptr;
 
+#ifdef Q_OS_MACOS
+// Poll SDL every 1 ms so a controller event waits at most ~1 ms on the main thread before it is sent
+#define UPDATE_INTERVAL_MS 1
+#else
 #define UPDATE_INTERVAL_MS 4
+#endif
 #define MOVE_CHECK_MS 1000
 
 ControllerManager *ControllerManager::GetInstance()
@@ -154,6 +159,9 @@ ControllerManager::ControllerManager(QObject *parent)
 		return;
 
 	auto timer = new QTimer(this);
+#ifdef Q_OS_MACOS
+	timer->setTimerType(Qt::PreciseTimer);
+#endif
 	connect(timer, &QTimer::timeout, this, &ControllerManager::HandleEvents);
 	timer->start(UPDATE_INTERVAL_MS);
 	auto move_timer = new QTimer(this);
@@ -925,6 +933,16 @@ bool Controller::IsDualSense()
 	if(!controller)
 		return false;
 	return is_dualsense;
+#endif
+	return false;
+}
+
+bool Controller::IsDualShock4()
+{
+#ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	if(!controller || is_steam_virtual || is_steam_virtual_unmasked)
+		return false;
+	return SDL_GameControllerGetType(controller) == SDL_CONTROLLER_TYPE_PS4;
 #endif
 	return false;
 }

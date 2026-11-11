@@ -282,6 +282,10 @@ class Settings : public QObject
 		bool GetAllowJoystickBackgroundEvents() const { return settings.value("settings/allow_joystick_background_events", true).toBool(); }
 		void SetAllowJoystickBackgroundEvents(bool enabled) { settings.setValue("settings/allow_joystick_background_events", enabled); }
 
+		// macOS: take DualSense / DualShock 4 input from GameController.framework callbacks instead of polled SDL events
+		bool GetMacGameControllerInput() const { return settings.value("settings/mac_gamecontroller_input", true).toBool(); }
+		void SetMacGameControllerInput(bool enabled) { settings.setValue("settings/mac_gamecontroller_input", enabled); }
+
 		bool GetStartMicUnmuted() const          { return settings.value("settings/start_mic_unmuted", false).toBool(); }
 		void SetStartMicUnmuted(bool unmuted) { return settings.setValue("settings/start_mic_unmuted", unmuted); }
 

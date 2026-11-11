@@ -11,6 +11,8 @@
 #include <QString>
 #include <QTimer>
 
+#include <atomic>
+
 #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
 #include <SDL.h>
 #include <chiaki/orientation.h>
@@ -33,8 +35,9 @@ class ControllerManager : public QObject
 #endif
 		QMap<int, Controller *> open_controllers;
 		bool creating_controller_mapping;
-		bool joystick_allow_background_events;
-		bool is_app_active;
+		// Atomic: also read by the macOS GameController input queue
+		std::atomic<bool> joystick_allow_background_events;
+		std::atomic<bool> is_app_active;
 		bool moved;
 		uint8_t dualsense_intensity;
 
@@ -56,6 +59,8 @@ class ControllerManager : public QObject
 		void SetButtonsByPos();
 		void SetAllowJoystickBackgroundEvents(bool enabled);
 		void SetIsAppActive(bool active);
+		// Whether controller input should be used now (thread-safe), same rule as the SDL event path
+		bool IsInputAllowed() const { return joystick_allow_background_events || is_app_active; }
 		void SetDualSenseIntensity(uint8_t intensity) { dualsense_intensity = intensity; };
 		uint8_t GetDualSenseIntensity() { return dualsense_intensity; };
 		void creatingControllerMapping(bool creating_controller_mapping);
@@ -139,6 +144,7 @@ class Controller : public QObject
 		void ChangeLEDColor(const uint8_t *led_color);
 		void ChangePlayerIndex(const uint8_t player_index);
 		bool IsDualSense();
+		bool IsDualShock4();
 		bool IsHandheld();
 		bool IsSteamVirtual();
 		bool IsSteamVirtualUnmasked();

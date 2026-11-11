@@ -25,6 +25,7 @@
 // Using Q_OS_MACOS instead of __APPLE__ doesn't work for the necessary enums to be included
 #ifdef __APPLE__
 #include <macMicPermission.h>
+#include <macGameController.h>
 #endif
 
 #include "exception.h"
@@ -109,6 +110,9 @@ class SdeckHapticsWorker;
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 		bool vertical_sdeck;
 		bool enable_steamdeck_haptics;
+#endif
+#ifdef Q_OS_MACOS
+		bool mac_gamecontroller_input = false;
 #endif
 #if CHIAKI_GUI_ENABLE_SPEEX
 		bool speech_processing_enabled;
@@ -219,6 +223,22 @@ class StreamSession : public QObject
 		bool rumble_haptics_connected;
 		bool rumble_haptics_on;
 		float PS_TOUCHPAD_MAX_X, PS_TOUCHPAD_MAX_Y;
+#ifdef Q_OS_MACOS
+		// Event-driven DualSense/DualShock 4 input from GameController.framework (see macGameController.h).
+		// The SDL controllers whose ids are in gc_covered_controllers only provide effects and the mic
+		// button; their input comes from gc_state instead.
+		MacGameControllerInput *mac_gc_input = nullptr;
+		QSet<int> gc_covered_controllers; // main thread
+		// Orders state sends between the main thread and the GameController queue; guards the fields below
+		QMutex gc_send_mutex;
+		ChiakiControllerState gc_state;     // combined GameController state
+		ChiakiControllerState gc_pre_state;  // sources ORed before gc_state, as of the last SendFeedbackState()
+		ChiakiControllerState gc_post_state; // sources ORed after it
+		bool gc_fast_path = false;          // false while input block or D-pad-as-touch need the main thread
+		std::atomic<bool> gc_main_update_queued { false };
+		void GameControllerStateChanged(const ChiakiControllerState &state, bool buttons_changed);
+		void UpdateGameControllerCoverage();
+#endif
 		ChiakiControllerState keyboard_state;
 		ChiakiControllerState touch_state;
 		QMap<int, uint8_t> touch_tracker;
@@ -260,6 +280,16 @@ class StreamSession : public QObject
 		size_t audio_out_ring_write_pos = 0;
 		size_t audio_out_ring_fill = 0;
 		bool audio_out_overflow_logged = false;
+		// Latency control (all guarded by audio_out_ring_mutex): bytes per 10 ms frame, crossfade length
+		// at a cut, target for ring + SDL queue, and the lowest level seen in the current window
+		size_t audio_out_frame_size = 0;
+		size_t audio_out_fade_frames = 0;
+		size_t audio_out_latency_target = 0;
+		size_t audio_out_latency_window_min = SIZE_MAX;
+		size_t audio_out_latency_window_bytes = 0;
+		size_t audio_out_trimmed_bytes = 0;
+		unsigned int audio_out_trim_count = 0;
+		uint64_t audio_out_trim_log_ms = 0;
 		QMutex audio_out_drain_mutex;
 		QWaitCondition audio_out_drain_wait;
 		QThread *audio_out_drain_thread = nullptr;
@@ -284,6 +314,8 @@ class StreamSession : public QObject
 		size_t haptics_retry_attempt = 0;
 		SDL_AudioCVT haptics_cvt;
 		uint8_t *haptics_resampler_buf;
+		// Newest haptics audio submitted to SDL (only touched by the haptics callback thread)
+		QByteArray haptics_recent;
 		MicBuf mic_buf;
 		QMutex mic_ring_mutex;
 		QByteArray mic_ring_buf;
@@ -300,6 +332,9 @@ class StreamSession : public QObject
 		void StopAudioOutDrainThread();
 		void AudioOutDrainThreadMain();
 		void QueueAudioOutData(const QByteArray &audio_data);
+		void ResetAudioOutRingLocked();
+		void DropAudioOutRingFrontLocked(size_t bytes);
+		void RegulateAudioOutLatencyLocked(size_t sdl_queued, size_t incoming);
 		void DrainAudioOutRingBuffer();
 		void PushAudioFrame(int16_t *buf, size_t samples_count);
 		void PushHapticsFrame(uint8_t *buf, size_t buf_size);
@@ -404,6 +439,7 @@ class StreamSession : public QObject
 		void UpdateGamepads();
 		void DpadSendFeedbackState();
 		void SendFeedbackState();
+		void SendFeedbackStateInternal(bool from_dpad_timer);
 };
 
 Q_DECLARE_METATYPE(ChiakiQuitReason)

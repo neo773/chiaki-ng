@@ -20,6 +20,11 @@
 
 #include <cstring>
 
+#ifdef Q_OS_MACOS
+#include <pthread.h>
+#include <macActivity.h>
+#endif
+
 #define SETSU_UPDATE_INTERVAL_MS 4
 #define STEAMDECK_UPDATE_INTERVAL_MS 4
 #define STEAMDECK_HAPTIC_INTERVAL_MS 10 // check every interval
@@ -28,6 +33,11 @@
 #define DPAD_TOUCH_UPDATE_INTERVAL_MS 10
 #define STEAMDECK_HAPTIC_PACKETS_PER_ANALYSIS 4 // send packets every interval * packets per analysis
 #define RUMBLE_HAPTICS_PACKETS_PER_RUMBLE 3
+// One rumble tick's worth; anything older only delays the rumble
+#define RUMBLE_HAPTICS_QUEUE_MAX RUMBLE_HAPTICS_PACKETS_PER_RUMBLE
+// DualSense haptics queue: trim back to the newest KEEP ms once more than MAX ms is queued
+#define HAPTICS_MAX_QUEUED_MS 60
+#define HAPTICS_KEEP_QUEUED_MS 20
 #define STEAMDECK_HAPTIC_SAMPLING_RATE 3000
 // DualShock4 touchpad is 1920 x 942
 #define PS4_TOUCHPAD_MAX_X 1920.0f
@@ -47,6 +57,13 @@
 #if CHIAKI_GUI_ENABLE_SPEEX
 #define ECHO_QUEUE_MAX 40
 #endif
+// Audio output latency control. Ring + SDL queue may stand at most AUDIO_OUT_HEADROOM_FRAMES (10 ms each)
+// above the audio buffer size; if the lowest level over a window of AUDIO_OUT_LATENCY_WINDOW_FRAMES of
+// stream time is still above that, the excess is cut from the front of the ring.
+#define AUDIO_OUT_HEADROOM_FRAMES 2
+#define AUDIO_OUT_LATENCY_WINDOW_FRAMES 30
+#define AUDIO_OUT_RING_MIN_FRAMES 4
+#define AUDIO_OUT_TRIM_LOG_INTERVAL_MS 2000
 
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 class SdeckHapticsWorker : public QObject
@@ -309,6 +326,9 @@ StreamSessionConnectInfo::StreamSessionConnectInfo(
 	this->rumble_haptics_intensity = settings->GetRumbleHapticsIntensity();
 	this->buttons_by_pos = settings->GetButtonsByPosition();
 	this->start_mic_unmuted = settings->GetStartMicUnmuted();
+#ifdef Q_OS_MACOS
+	this->mac_gamecontroller_input = settings->GetMacGameControllerInput();
+#endif
 	this->port_guessing_enabled = settings->GetPortGuessingEnabled();
 	this->port_guess_count = settings->GetPortGuessCount();
 	this->port_guess_socket_count = settings->GetPortGuessSocketCount();
@@ -708,11 +728,30 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 		}
 	});
 
+#if defined(Q_OS_MACOS) && CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	if(connect_info.mac_gamecontroller_input)
+	{
+		chiaki_controller_state_set_idle(&gc_state);
+		chiaki_controller_state_set_idle(&gc_pre_state);
+		chiaki_controller_state_set_idle(&gc_post_state);
+		mac_gc_input = new MacGameControllerInput(log.GetChiakiLog(),
+			[this](const ChiakiControllerState &state, bool buttons_changed) { GameControllerStateChanged(state, buttons_changed); },
+			[this]() { UpdateGameControllerCoverage(); },
+			[]() { return ControllerManager::GetInstance()->IsInputAllowed(); });
+		UpdateGameControllerCoverage();
+	}
+#endif
+
 	StartAudioOutDrainThread();
 }
 
 StreamSession::~StreamSession()
 {
+#ifdef Q_OS_MACOS
+	// First, so no GameController callback can reach this object or the session below any more
+	delete mac_gc_input;
+	mac_gc_input = nullptr;
+#endif
 	mic_active.storeRelaxed(false);
 	StopAudioOutDrainThread();
 	if(audio_out)
@@ -720,13 +759,13 @@ StreamSession::~StreamSession()
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
 		audio_out_ring_buf.clear();
-		audio_out_ring_read_pos = 0;
-		audio_out_ring_write_pos = 0;
-		audio_out_ring_fill = 0;
-		audio_out_overflow_logged = false;
+		ResetAudioOutRingLocked();
 	}
 	if(audio_in)
 		SDL_CloseAudioDevice(audio_in);
+#ifdef Q_OS_MACOS
+	macEndStreamingActivity(this);
+#endif
 
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 	StopSdeckHaptics();
@@ -828,6 +867,10 @@ void StreamSession::Start()
 		throw ChiakiException("Chiaki Session Start failed");
 	}
 	session_started = true;
+#ifdef Q_OS_MACOS
+	// Keep App Nap and timer coalescing off while streaming; ended in the destructor
+	macBeginStreamingActivity(this);
+#endif
 }
 
 void StreamSession::Stop()
@@ -1191,7 +1234,15 @@ void StreamSession::UpdateGamepads()
 				continue;
 			}
 			CHIAKI_LOGI(log.GetChiakiLog(), "Controller %d opened: \"%s\"", controller_id, controller->GetName().toLocal8Bit().constData());
+#ifdef Q_OS_MACOS
+			// A controller read through GameController sends its own updates; its SDL events don't matter
+			connect(controller, &Controller::StateChanged, this, [this, controller_id]() {
+				if(!gc_covered_controllers.contains(controller_id))
+					SendFeedbackState();
+			});
+#else
 			connect(controller, &Controller::StateChanged, this, &StreamSession::SendFeedbackState);
+#endif
 			connect(controller, &Controller::MicButtonPush, this, &StreamSession::ToggleMute);
 			controllers[controller_id] = controller;
 			if(controller->IsHandheld())
@@ -1229,6 +1280,13 @@ void StreamSession::UpdateGamepads()
 			}
 		}
 	}
+#ifdef Q_OS_MACOS
+	if(mac_gc_input)
+	{
+		UpdateGameControllerCoverage(); // also sends the state
+		return;
+	}
+#endif
 	SendFeedbackState();
 #endif
 }
@@ -1266,62 +1324,20 @@ void StreamSession::RetryHaptics(quint64 generation)
 
 void StreamSession::DpadSendFeedbackState()
 {
-	ChiakiControllerState state;
-	chiaki_controller_state_set_idle(&state);
-
-#if CHIAKI_GUI_ENABLE_SETSU
-	// setsu is the one that potentially has gyro/accel/orient so copy that directly first
-	state = setsu_state;
-#endif
-
-	for(auto controller : controllers)
-	{
-		auto controller_state = controller->GetState();
-		chiaki_controller_state_or(&state, &state, &controller_state);
-	}
-
-#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
-	chiaki_controller_state_or(&state, &state, &sdeck_state);
-#endif
-	chiaki_controller_state_or(&state, &state, &keyboard_state);
-	chiaki_controller_state_or(&state, &state, &touch_state);
-
-	if(input_block)
-	{
-		// Only unblock input after all buttons were released
-		if(input_block == 2 && !state.buttons)
-			input_block = 0;
-		else
-		{
-			chiaki_controller_state_set_idle(&state);
-			chiaki_controller_state_set_idle(&keyboard_state);
-		}
-	}
-	if((dpad_touch_shortcut1 || dpad_touch_shortcut2 || dpad_touch_shortcut3 || dpad_touch_shortcut4) && (!dpad_touch_shortcut1 || (state.buttons & dpad_touch_shortcut1)) && (!dpad_touch_shortcut2 || (state.buttons & dpad_touch_shortcut2)) && (!dpad_touch_shortcut3 || (state.buttons & dpad_touch_shortcut3)) && (!dpad_touch_shortcut4 || (state.buttons & dpad_touch_shortcut4)))
-	{
-		if(!dpad_regular_touch_switched)
-		{
-			dpad_regular_touch_switched = true;
-			dpad_regular = !dpad_regular;
-		}
-	}
-	else
-		dpad_regular_touch_switched = false;
-	if(dpad_touch_increment && !dpad_regular && (state.buttons & (CHIAKI_CONTROLLER_BUTTON_DPAD_DOWN | CHIAKI_CONTROLLER_BUTTON_DPAD_LEFT | CHIAKI_CONTROLLER_BUTTON_DPAD_RIGHT | CHIAKI_CONTROLLER_BUTTON_DPAD_UP)))
-	{
-		HandleDpadTouchEvent(&state, true);
-	}
-	else
-	{
-		if(dpad_touch_id >= 0 && !dpad_touch_stop_timer->isActive())
-			dpad_touch_stop_timer->start(NEW_DPAD_TOUCH_INTERVAL_MS);
-	}
-	chiaki_controller_state_or(&state, &state, &dpad_touch_state);
-	chiaki_session_set_controller_state(&session, &state);
+	SendFeedbackStateInternal(true);
 }
 
 void StreamSession::SendFeedbackState()
 {
+	SendFeedbackStateInternal(false);
+}
+
+void StreamSession::SendFeedbackStateInternal(bool from_dpad_timer)
+{
+#ifdef Q_OS_MACOS
+	// Held until the state is sent, so a GameController update can't be overwritten by an older one
+	QMutexLocker gc_locker(&gc_send_mutex);
+#endif
 	ChiakiControllerState state;
 	chiaki_controller_state_set_idle(&state);
 
@@ -1330,17 +1346,35 @@ void StreamSession::SendFeedbackState()
 	state = setsu_state;
 #endif
 
-	for(auto controller : controllers)
+	for(auto it = controllers.cbegin(); it != controllers.cend(); ++it)
 	{
-		auto controller_state = controller->GetState();
+#ifdef Q_OS_MACOS
+		// Input of these comes from GameController, merged below
+		if(gc_covered_controllers.contains(it.key()))
+			continue;
+#endif
+		auto controller_state = it.value()->GetState();
 		chiaki_controller_state_or(&state, &state, &controller_state);
 	}
 
+#ifdef Q_OS_MACOS
+	gc_pre_state = state;
+	chiaki_controller_state_or(&state, &state, &gc_state);
+	ChiakiControllerState post_state;
+	chiaki_controller_state_set_idle(&post_state);
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+	chiaki_controller_state_or(&post_state, &post_state, &sdeck_state);
+#endif
+	chiaki_controller_state_or(&post_state, &post_state, &keyboard_state);
+	chiaki_controller_state_or(&post_state, &post_state, &touch_state);
+	chiaki_controller_state_or(&state, &state, &post_state);
+#else
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 	chiaki_controller_state_or(&state, &state, &sdeck_state);
 #endif
 	chiaki_controller_state_or(&state, &state, &keyboard_state);
 	chiaki_controller_state_or(&state, &state, &touch_state);
+#endif
 
 	if(input_block)
 	{
@@ -1365,7 +1399,7 @@ void StreamSession::SendFeedbackState()
 		dpad_regular_touch_switched = false;
 	if(dpad_touch_increment && !dpad_regular && (state.buttons & (CHIAKI_CONTROLLER_BUTTON_DPAD_DOWN | CHIAKI_CONTROLLER_BUTTON_DPAD_LEFT | CHIAKI_CONTROLLER_BUTTON_DPAD_RIGHT | CHIAKI_CONTROLLER_BUTTON_DPAD_UP)))
 	{
-		HandleDpadTouchEvent(&state);
+		HandleDpadTouchEvent(&state, from_dpad_timer);
 	}
 	else
 	{
@@ -1373,8 +1407,83 @@ void StreamSession::SendFeedbackState()
 			dpad_touch_stop_timer->start(NEW_DPAD_TOUCH_INTERVAL_MS);
 	}
 	chiaki_controller_state_or(&state, &state, &dpad_touch_state);
+#ifdef Q_OS_MACOS
+	// With no input block and no D-pad-as-touch mode, everything above is a plain OR of the sources,
+	// so the GameController queue can send pre | gc_state | post itself without the main thread
+	chiaki_controller_state_or(&post_state, &post_state, &dpad_touch_state);
+	gc_post_state = post_state;
+	gc_fast_path = !input_block && !(dpad_touch_increment && !dpad_regular);
+#endif
 	chiaki_session_set_controller_state(&session, &state);
 }
+
+#ifdef Q_OS_MACOS
+void StreamSession::GameControllerStateChanged(const ChiakiControllerState &state, bool buttons_changed)
+{
+	// Runs on the GameController input queue
+	bool need_main_thread = buttons_changed; // input block release and D-pad shortcuts look at buttons
+	{
+		QMutexLocker locker(&gc_send_mutex);
+		gc_state = state;
+		if(gc_fast_path)
+		{
+			ChiakiControllerState combined = gc_pre_state;
+			chiaki_controller_state_or(&combined, &combined, &gc_state);
+			chiaki_controller_state_or(&combined, &combined, &gc_post_state);
+			chiaki_session_set_controller_state(&session, &combined);
+		}
+		else
+			need_main_thread = true;
+	}
+	if(need_main_thread && !gc_main_update_queued.exchange(true))
+	{
+		QMetaObject::invokeMethod(this, [this]() {
+			gc_main_update_queued = false;
+			SendFeedbackState();
+		}, Qt::QueuedConnection);
+	}
+}
+
+void StreamSession::UpdateGameControllerCoverage()
+{
+	if(!mac_gc_input)
+		return;
+	// GameController exposes no vendor/product id or serial, so SDL and GameController devices are
+	// matched by class: if both see the same non-zero number of DualSense (resp. DualShock 4)
+	// controllers, all of that class take input from GameController and SDL keeps them for effects
+	// and the mic button only. Every controller is ORed into one state anyway, so which physical pad
+	// is which doesn't matter, only that each is read exactly once. On any mismatch that class stays
+	// on SDL.
+	int sdl_dualsense = 0, sdl_dualshock4 = 0;
+	for(auto controller : std::as_const(controllers))
+	{
+		if(controller->IsDualSense() || controller->IsDualSenseEdge())
+			sdl_dualsense++;
+		else if(controller->IsDualShock4())
+			sdl_dualshock4++;
+	}
+	unsigned mask = MacGameControllerClassNone;
+	if(sdl_dualsense > 0 && mac_gc_input->Count(MacGameControllerClassDualSense) == sdl_dualsense)
+		mask |= MacGameControllerClassDualSense;
+	if(sdl_dualshock4 > 0 && mac_gc_input->Count(MacGameControllerClassDualShock4) == sdl_dualshock4)
+		mask |= MacGameControllerClassDualShock4;
+
+	QSet<int> covered;
+	for(auto it = controllers.cbegin(); it != controllers.cend(); ++it)
+	{
+		Controller *controller = it.value();
+		if(((mask & MacGameControllerClassDualSense) && (controller->IsDualSense() || controller->IsDualSenseEdge()))
+			|| ((mask & MacGameControllerClassDualShock4) && controller->IsDualShock4()))
+			covered.insert(it.key());
+	}
+	if(covered != gc_covered_controllers)
+		CHIAKI_LOGI(log.GetChiakiLog(), "Controller input: %d controller(s) via GameController, %d via SDL",
+			(int)covered.size(), (int)(controllers.size() - covered.size()));
+	gc_covered_controllers = covered;
+	mac_gc_input->SetMergedClasses(mask);
+	SendFeedbackState();
+}
+#endif
 
 void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 {
@@ -1390,10 +1499,7 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
 		audio_out_ring_buf.clear();
-		audio_out_ring_read_pos = 0;
-		audio_out_ring_write_pos = 0;
-		audio_out_ring_fill = 0;
-		audio_out_overflow_logged = false;
+		ResetAudioOutRingLocked();
 	}
 
 	SDL_AudioSpec spec = {0};
@@ -1428,18 +1534,24 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
-		audio_out_ring_buf.resize((int)(audio_buffer_size * 8));
-		audio_out_ring_read_pos = 0;
-		audio_out_ring_write_pos = 0;
-		audio_out_ring_fill = 0;
-		audio_out_overflow_logged = false;
+		// The ring holds what doesn't fit into SDL's queue (2x buffer) yet. Everything in it is latency,
+		// so keep it small: 2x buffer, at least a few 10 ms frames, in whole frames.
+		audio_out_frame_size = (rate / 100) * audio_out_sample_size;
+		audio_out_fade_frames = rate / 500; // 2 ms crossfade at a cut
+		audio_out_latency_target = audio_buffer_size + AUDIO_OUT_HEADROOM_FRAMES * audio_out_frame_size;
+		size_t ring_size = qMax((size_t)audio_buffer_size * 2, AUDIO_OUT_RING_MIN_FRAMES * audio_out_frame_size);
+		if(audio_out_frame_size)
+			ring_size = (ring_size + audio_out_frame_size - 1) / audio_out_frame_size * audio_out_frame_size;
+		audio_out_ring_buf.resize((int)ring_size);
+		ResetAudioOutRingLocked();
 	}
 
 	SDL_PauseAudioDevice(audio_out, 0);
 	StartAudioOutDrainThread();
 
-	CHIAKI_LOGI(log.GetChiakiLog(), "Audio Device '%s' opened with %u channels @ %d Hz, buffer size %u",
-				qPrintable(audio_out_device_name), obtained.channels, obtained.freq, obtained.size);
+	CHIAKI_LOGI(log.GetChiakiLog(), "Audio Device '%s' opened with %u channels @ %d Hz, buffer size %u bytes = %u samples (%.1f ms, requested %u samples)",
+				qPrintable(audio_out_device_name), obtained.channels, obtained.freq, obtained.size, obtained.samples,
+				obtained.freq > 0 ? obtained.samples * 1000.0 / obtained.freq : 0.0, spec.samples);
 }
 
 void StreamSession::InitMic(unsigned int channels, unsigned int rate)
@@ -1850,6 +1962,10 @@ void StreamSession::QueueRumbleHaptics(uint16_t strength)
 {
 	if(!rumble_haptics_connected)
 		return;
+	// The timer consumes RUMBLE_HAPTICS_PACKETS_PER_RUMBLE per tick; if packets arrive in a burst after
+	// a stall, drop the oldest instead of letting the rumble lag behind for the rest of the session
+	while(rumble_haptics.size() >= RUMBLE_HAPTICS_QUEUE_MAX)
+		rumble_haptics.dequeue();
 	rumble_haptics.enqueue(strength);
 }
 
@@ -1963,18 +2079,7 @@ void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 
 	QByteArray buf((int)(samples_count * audio_out_sample_size), 0);
 
-	// qDebug() << "Audio queue" << (SDL_GetQueuedAudioSize(audio_out) / audio_out_sample_size / samples_count) * 10 << "ms";
-	// If the SDL queue runs away, drop the stale backlog and resume from the latest frame.
-	if(SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
-	{
-		CHIAKI_LOGW(log.GetChiakiLog(), "Audio queue exceeded latency threshold, clearing queued audio");
-		SDL_ClearQueuedAudio(audio_out);
-		QMutexLocker locker(&audio_out_ring_mutex);
-		audio_out_ring_read_pos = 0;
-		audio_out_ring_write_pos = 0;
-		audio_out_ring_fill = 0;
-		audio_out_overflow_logged = false;
-	}
+	// Backlog is bounded by the latency control in QueueAudioOutData()
 	if(audio_volume < SDL_MIX_MAXVOLUME)
 		SDL_MixAudioFormat((uint8_t *)buf.data(), (uint8_t *)og_buf, AUDIO_S16SYS, buf.size(), audio_volume);
 	else
@@ -2010,14 +2115,108 @@ queue_audio:
 	QueueAudioOutData(buf);
 }
 
+void StreamSession::ResetAudioOutRingLocked()
+{
+	audio_out_ring_read_pos = 0;
+	audio_out_ring_write_pos = 0;
+	audio_out_ring_fill = 0;
+	audio_out_overflow_logged = false;
+	audio_out_latency_window_min = SIZE_MAX;
+	audio_out_latency_window_bytes = 0;
+}
+
+void StreamSession::DropAudioOutRingFrontLocked(size_t bytes)
+{
+	const size_t capacity = (size_t)audio_out_ring_buf.size();
+	if(capacity == 0 || bytes == 0)
+		return;
+	bytes = qMin(bytes, audio_out_ring_fill);
+	const size_t old_pos = audio_out_ring_read_pos;
+	const size_t new_pos = (old_pos + bytes) % capacity;
+
+	// Crossfade from the dropped audio (which continues what SDL already has) into the audio after the
+	// cut, so the splice doesn't click. Only possible if both sides have a full fade length available.
+	const size_t sample_size = audio_out_sample_size;
+	const size_t fade_frames = audio_out_fade_frames;
+	const size_t fade_bytes = fade_frames * sample_size;
+	if(sample_size && fade_frames && bytes >= fade_bytes && audio_out_ring_fill - bytes >= fade_bytes)
+	{
+		char *ring = audio_out_ring_buf.data();
+		const size_t channels = sample_size / sizeof(int16_t);
+		for(size_t f = 0; f < fade_frames; f++)
+		{
+			const float w = (float)(f + 1) / (float)(fade_frames + 1);
+			for(size_t c = 0; c < channels; c++)
+			{
+				const size_t off = f * sample_size + c * sizeof(int16_t);
+				char *old_ptr = ring + (old_pos + off) % capacity;
+				char *new_ptr = ring + (new_pos + off) % capacity;
+				int16_t old_s, new_s;
+				memcpy(&old_s, old_ptr, sizeof(old_s));
+				memcpy(&new_s, new_ptr, sizeof(new_s));
+				const float mixed = (float)old_s * (1.0f - w) + (float)new_s * w;
+				new_s = (int16_t)qBound(-32768.0f, mixed, 32767.0f);
+				memcpy(new_ptr, &new_s, sizeof(new_s));
+			}
+		}
+	}
+
+	audio_out_ring_read_pos = new_pos;
+	audio_out_ring_fill -= bytes;
+}
+
+void StreamSession::RegulateAudioOutLatencyLocked(size_t sdl_queued, size_t incoming)
+{
+	// Once audio is queued, arrival and playback run at the same rate, so whatever a network stall
+	// piled up would otherwise stay as latency for the rest of the session. Track the lowest total
+	// (ring + SDL queue) over a window of stream time; if even that stays above the target, the
+	// backlog is standing rather than jitter, and the excess is cut from the front of the ring.
+	if(!audio_out_frame_size || !audio_out_latency_target)
+		return;
+	audio_out_latency_window_min = qMin(audio_out_latency_window_min, audio_out_ring_fill + sdl_queued);
+	audio_out_latency_window_bytes += incoming;
+	if(audio_out_latency_window_bytes < AUDIO_OUT_LATENCY_WINDOW_FRAMES * audio_out_frame_size)
+		return;
+
+	const size_t standing = audio_out_latency_window_min;
+	audio_out_latency_window_min = SIZE_MAX;
+	audio_out_latency_window_bytes = 0;
+	if(standing <= audio_out_latency_target)
+		return;
+
+	// Whole 10 ms frames only, and only what is still in the ring (SDL's queue can't be trimmed)
+	size_t trim = qMin(standing - audio_out_latency_target, audio_out_ring_fill);
+	trim -= trim % audio_out_frame_size;
+	if(trim == 0)
+		return;
+	DropAudioOutRingFrontLocked(trim);
+
+	audio_out_trimmed_bytes += trim;
+	audio_out_trim_count++;
+	const uint64_t now = chiaki_time_now_monotonic_ms();
+	if(audio_out_trim_log_ms == 0 || now - audio_out_trim_log_ms >= AUDIO_OUT_TRIM_LOG_INTERVAL_MS)
+	{
+		const size_t bytes_per_ms = audio_out_frame_size / 10;
+		CHIAKI_LOGD(log.GetChiakiLog(), "Audio latency control: dropped %zu ms of backlog in %u cut(s), standing queue was %zu ms (target %zu ms)",
+			audio_out_trimmed_bytes / bytes_per_ms, audio_out_trim_count, standing / bytes_per_ms, audio_out_latency_target / bytes_per_ms);
+		audio_out_trim_log_ms = now;
+		audio_out_trimmed_bytes = 0;
+		audio_out_trim_count = 0;
+	}
+}
+
 void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 {
+	// Read before taking the ring lock; the drain thread only moves data from the ring into this queue
+	const size_t sdl_queued = audio_out ? SDL_GetQueuedAudioSize(audio_out) : 0;
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
 		size_t capacity = (size_t)audio_out_ring_buf.size();
 		size_t data_size = (size_t)audio_data.size();
 		if(capacity == 0 || data_size == 0)
 			return;
+
+		RegulateAudioOutLatencyLocked(sdl_queued, data_size);
 
 		const char *data = audio_data.constData();
 		if(data_size >= capacity)
@@ -2030,9 +2229,7 @@ void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 		}
 		else if(data_size > capacity - audio_out_ring_fill)
 		{
-			size_t bytes_to_drop = data_size - (capacity - audio_out_ring_fill);
-			audio_out_ring_read_pos = (audio_out_ring_read_pos + bytes_to_drop) % capacity;
-			audio_out_ring_fill -= bytes_to_drop;
+			DropAudioOutRingFrontLocked(data_size - (capacity - audio_out_ring_fill));
 			if(!audio_out_overflow_logged)
 			{
 				CHIAKI_LOGW(log.GetChiakiLog(), "Audio output ring overflow, dropping stale queued audio");
@@ -2057,22 +2254,14 @@ void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 
 void StreamSession::DrainAudioOutRingBuffer()
 {
+	// SDL's queue is only ever filled up to this, so it can't exceed it; the backlog beyond it sits in
+	// the ring, where RegulateAudioOutLatencyLocked() trims it
 	const size_t target_queue_size = audio_buffer_size * 2;
 
 	while(audio_out)
 	{
-		if(SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
-		{
-			CHIAKI_LOGW(log.GetChiakiLog(), "Audio queue exceeded latency threshold, clearing queued audio");
-			SDL_ClearQueuedAudio(audio_out);
-			QMutexLocker locker(&audio_out_ring_mutex);
-			audio_out_ring_read_pos = 0;
-			audio_out_ring_write_pos = 0;
-			audio_out_ring_fill = 0;
-			audio_out_overflow_logged = false;
-		}
-
-		if(SDL_GetQueuedAudioSize(audio_out) >= target_queue_size)
+		const size_t queued = SDL_GetQueuedAudioSize(audio_out);
+		if(queued >= target_queue_size)
 			break;
 
 		QByteArray audio_chunk;
@@ -2085,7 +2274,7 @@ void StreamSession::DrainAudioOutRingBuffer()
 			}
 
 			size_t capacity = (size_t)audio_out_ring_buf.size();
-			size_t remaining_target = target_queue_size - SDL_GetQueuedAudioSize(audio_out);
+			size_t remaining_target = target_queue_size - queued;
 			size_t chunk_size = qMin(audio_out_ring_fill, qMin(remaining_target, capacity - audio_out_ring_read_pos));
 			audio_chunk = QByteArray(audio_out_ring_buf.constData() + audio_out_ring_read_pos, (int)chunk_size);
 			audio_out_ring_read_pos = (audio_out_ring_read_pos + chunk_size) % capacity;
@@ -2134,6 +2323,10 @@ void StreamSession::StopAudioOutDrainThread()
 
 void StreamSession::AudioOutDrainThreadMain()
 {
+#ifdef Q_OS_MACOS
+	// Refills SDL's queue between device pulls; keep it off the efficiency cores and out of timer coalescing
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 	audio_out_drain_mutex.lock();
 	while(audio_out_drain_thread_running)
 	{
@@ -2367,17 +2560,36 @@ void StreamSession::PushHapticsFrame(uint8_t *buf, size_t buf_size)
 		return;
 	}
 
-	// Keep at most 60 ms queued (haptics_buffer_size is 10 ms of 4-channel S16) so haptics
-	// don't fall behind the game after a network stall
-	const Uint32 haptics_most_queued = static_cast<Uint32>(haptics_buffer_size * 4 * sizeof(int16_t) * 6);
+	// Keep at most HAPTICS_MAX_QUEUED_MS queued so haptics don't fall behind the game after a network
+	// stall. Past that, drop the oldest audio down to the newest HAPTICS_KEEP_QUEUED_MS instead of
+	// clearing everything, which left the motors idle until the next packets arrived.
+	// haptics_buffer_size is 10 ms of 4-channel S16 at 48 kHz.
+	const size_t haptics_frame_bytes = 4 * sizeof(int16_t);
+	const size_t haptics_ms_bytes = haptics_buffer_size * haptics_frame_bytes / 10;
+	const size_t haptics_most_queued = haptics_ms_bytes * HAPTICS_MAX_QUEUED_MS;
+	const size_t haptics_keep_queued = haptics_ms_bytes * HAPTICS_KEEP_QUEUED_MS;
+	const size_t incoming = static_cast<size_t>(cvt.len_cvt);
 	if (SDL_GetQueuedAudioSize(haptics_output) > haptics_most_queued)
+	{
 		SDL_ClearQueuedAudio(haptics_output);
+		// haptics_recent is the newest audio submitted; with more than HAPTICS_MAX_QUEUED_MS queued, all of
+		// it was still in the queue just cleared, so putting its tail back is an exact drop-oldest
+		size_t keep = incoming < haptics_keep_queued ? haptics_keep_queued - incoming : 0;
+		keep = qMin(keep, static_cast<size_t>(haptics_recent.size()));
+		keep -= keep % haptics_frame_bytes;
+		if (keep > 0 && SDL_QueueAudio(haptics_output, haptics_recent.constData() + haptics_recent.size() - keep, static_cast<Uint32>(keep)) < 0)
+			CHIAKI_LOGE(log.GetChiakiLog(), "Failed to requeue haptics audio: %s", SDL_GetError());
+	}
 
 	if (SDL_QueueAudio(haptics_output, cvt.buf, cvt.len_cvt) < 0)
 	{
 		CHIAKI_LOGE(log.GetChiakiLog(), "Failed to submit haptics audio to device: %s", SDL_GetError());
 		return;
 	}
+
+	haptics_recent.append(reinterpret_cast<const char *>(cvt.buf), static_cast<qsizetype>(incoming));
+	if (static_cast<size_t>(haptics_recent.size()) > haptics_keep_queued)
+		haptics_recent.remove(0, haptics_recent.size() - static_cast<qsizetype>(haptics_keep_queued));
 }
 
 void StreamSession::Event(ChiakiEvent *event)
@@ -2397,6 +2609,9 @@ void StreamSession::Event(ChiakiEvent *event)
 			}
 			connected = false;
 			emit ConnectedChanged();
+#ifdef Q_OS_MACOS
+			macEndStreamingActivity(this);
+#endif
 			emit SessionQuit(event->quit.reason, event->quit.reason_str ? QString::fromUtf8(event->quit.reason_str) : QString());
 			break;
 		case CHIAKI_EVENT_REGIST:
@@ -2470,6 +2685,10 @@ void StreamSession::Event(ChiakiEvent *event)
 			QMetaObject::invokeMethod(this, [this]() {
 				for(auto controller : controllers)
 					controller->resetMotionControls();
+#ifdef Q_OS_MACOS
+				if(mac_gc_input)
+					mac_gc_input->ResetMotion();
+#endif
 			});
 #if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 			if(sdeck)
