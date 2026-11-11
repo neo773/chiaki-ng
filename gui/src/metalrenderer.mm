@@ -458,7 +458,8 @@ struct MetalRenderer::Private {
     std::atomic<bool> clear_requested{false};
 
     // "render" intervals (submitFrame -> commit) for Instruments' Points of Interest
-    os_log_t signpost_log = os_log_create("chiaki-ng", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+    // Off unless CHIAKI_SIGNPOSTS is set: each interval costs ~0.4 us even when not recording
+    os_log_t signpost_log = getenv("CHIAKI_SIGNPOSTS") ? os_log_create("chiaki-ng", OS_LOG_CATEGORY_POINTS_OF_INTEREST) : nullptr;
 
     // Render thread
     MappedFrame current;
@@ -1071,7 +1072,7 @@ bool MetalRenderer::submitFrame(AVFrame *frame, uint64_t first_packet_us, uint64
     timing.first_packet_us = first_packet_us;
     timing.decoded_us = decoded_us;
     timing.handoff_us = chiaki_time_now_monotonic_us();
-    if (os_signpost_enabled(d->signpost_log)) {
+    if (d->signpost_log && os_signpost_enabled(d->signpost_log)) {
         timing.signpost = os_signpost_id_generate(d->signpost_log);
         os_signpost_interval_begin(d->signpost_log, timing.signpost, "render");
     }

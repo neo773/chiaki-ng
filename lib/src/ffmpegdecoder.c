@@ -184,7 +184,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 	decoder->latest_frame_first_packet_us = 0;
 	decoder->latest_frame_decoded_us = 0;
 #ifdef CHIAKI_FFMPEG_DECODER_NATIVE_VT
-	if(!ffmpeg_decoder_signpost_log)
+	// Off unless asked for: each interval costs ~0.4 us even when Instruments is not recording
+	if(!ffmpeg_decoder_signpost_log && getenv("CHIAKI_SIGNPOSTS"))
 		ffmpeg_decoder_signpost_log = os_log_create("chiaki-ng", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
 #endif
 
