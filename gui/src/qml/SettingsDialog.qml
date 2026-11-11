@@ -927,10 +927,12 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Render Preset:")
+                        visible: Chiaki.settings.rendererBackend !== 2
                     }
 
                     C.ComboBox {
                         Layout.preferredWidth: 520
+                        visible: Chiaki.settings.rendererBackend !== 2
                         model: [qsTr("Fast"), qsTr("Default"), qsTr("High Quality"), qsTr("High Quality + Spatial Upscaling"), qsTr("High Quality + Advanced Spatial Upscaling"), qsTr("Custom")]
                         currentIndex: Chiaki.settings.videoPreset
                         onActivated: (index) => {
@@ -949,15 +951,18 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("(High Quality)")
+                        visible: Chiaki.settings.rendererBackend !== 2
                     }
 
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Frame Delivery:")
+                        visible: Chiaki.settings.rendererBackend !== 2
                     }
 
                     C.ComboBox {
                         Layout.preferredWidth: 400
+                        visible: Chiaki.settings.rendererBackend !== 2
                         model: [qsTr("Direct Mapping"), qsTr("Frame Queue")]
                         currentIndex: Chiaki.settings.directFrameMapping ? 0 : 1
                         onActivated: (index) => {
@@ -973,15 +978,18 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("(Direct Mapping)")
+                        visible: Chiaki.settings.rendererBackend !== 2
                     }
 
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Frame Mixer:")
+                        visible: Chiaki.settings.rendererBackend !== 2
                     }
 
                     C.ComboBox {
                         Layout.preferredWidth: 400
+                        visible: Chiaki.settings.rendererBackend !== 2
                         model: [qsTr("None"), qsTr("Oversample"), qsTr("Hermite"), qsTr("Linear"), qsTr("Cubic")]
                         enabled: !Chiaki.settings.directFrameMapping
                         currentIndex: Chiaki.settings.directFrameMapping ? 0 : Chiaki.settings.placeboFrameMixer
@@ -991,6 +999,7 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("(None)")
+                        visible: Chiaki.settings.rendererBackend !== 2
                     }
 
                     Label {
@@ -1000,7 +1009,7 @@ DialogView {
 
                     C.ComboBox {
                         Layout.preferredWidth: 400
-                        model: [qsTr("Vulkan"), qsTr("OpenGL")]
+                        model: Chiaki.settings.metalRendererAvailable ? [qsTr("Vulkan"), qsTr("OpenGL"), qsTr("Metal")] : [qsTr("Vulkan"), qsTr("OpenGL")]
                         currentIndex: Chiaki.settings.rendererBackend
                         onActivated: (index) => {
                             if (index === Chiaki.settings.rendererBackend)
@@ -1013,7 +1022,7 @@ DialogView {
 
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: qsTr("(Vulkan)")
+                        text: Chiaki.settings.metalRendererAvailable ? qsTr("(Metal)") : qsTr("(Vulkan)")
                     }
 
                     Label {
@@ -1037,7 +1046,7 @@ DialogView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         text: qsTr("Custom Renderer Settings")
-                        visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
+                        visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom && Chiaki.settings.rendererBackend !== 2
                     }
 
                     C.Button {
@@ -1045,10 +1054,10 @@ DialogView {
                         text: qsTr("Open")
                         onClicked: root.showPlaceboSettingsDialog()
                         Material.roundedScale: Material.SmallScale
-                        visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
+                        visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom && Chiaki.settings.rendererBackend !== 2
                     }
 
-                    Label { visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom }
+                    Label { visible: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom && Chiaki.settings.rendererBackend !== 2 }
 
                     Label {
                         Layout.alignment: Qt.AlignRight
@@ -1613,7 +1622,7 @@ DialogView {
                             from: 1
                             to: 10
                             stepSize: 1
-                            value: Chiaki.settings.audioBufferSize / 1920 ? (Chiaki.settings.audioBufferSize / 1920) : 5
+                            value: Chiaki.settings.audioBufferSize / 1920 ? (Chiaki.settings.audioBufferSize / 1920) : (Qt.platform.os == "osx" ? 1 : 5)
                             onMoved: Chiaki.settings.audioBufferSize = value * 1920;
                             KeyNavigation.up: audioInDevice
 

@@ -60,6 +60,7 @@ class QmlSettings : public QObject
     Q_PROPERTY(uint customResolutionHeight READ customResolutionHeight WRITE setCustomResolutionHeight NOTIFY customResolutionHeightChanged)
     Q_PROPERTY(int videoPreset READ videoPreset WRITE setVideoPreset NOTIFY videoPresetChanged)
     Q_PROPERTY(int rendererBackend READ rendererBackend WRITE setRendererBackend NOTIFY rendererBackendChanged)
+    Q_PROPERTY(bool metalRendererAvailable READ metalRendererAvailable CONSTANT)
     Q_PROPERTY(float sZoomFactor READ sZoomFactor WRITE setSZoomFactor NOTIFY sZoomFactorChanged)
     Q_PROPERTY(int packetLossReportedMax READ packetLossReportedMax WRITE setPacketLossReportedMax NOTIFY packetLossReportedMaxChanged)
     Q_PROPERTY(QString autoConnectMac READ autoConnectMac WRITE setAutoConnectMac NOTIFY autoConnectMacChanged)
@@ -318,6 +319,7 @@ public:
 
     int rendererBackend() const;
     void setRendererBackend(int backend);
+    bool metalRendererAvailable() const;
     Q_INVOKABLE bool restartApplication();
 
     QString autoConnectMac() const;

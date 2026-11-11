@@ -10,6 +10,7 @@
 #include <QLoggingCategory>
 #include <deque>
 #include <atomic>
+#include <memory>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -52,6 +53,8 @@ class StatsOverlayWidget;
 class BufferedPlaybackPacerThread;
 class DeferredPresentPacerThread;
 class DeferredSwapThread;
+class MetalRenderer;
+struct MetalFrameSink;
 
 class QmlMainWindow : public QWindow
 {
@@ -166,6 +169,11 @@ public slots:
     void updateVulkanDeferredSwap();
     void show();
     void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us = 0);
+    // Metal backend only. Safe from any thread (the decoder's frame thread calls it directly):
+    // hands the frame to the renderer (newest wins) and wakes the render thread. The sink
+    // outlives the window, so a late frame during teardown is just freed.
+    std::shared_ptr<MetalFrameSink> metalFrameSink() const { return metal_sink; }
+    static void presentMetalFrame(const std::shared_ptr<MetalFrameSink> &sink, ChiakiFfmpegFrame frame, int32_t frames_lost);
 
     AVBufferRef *vulkanHwDeviceCtx();
 
@@ -268,7 +276,7 @@ private:
     bool event(QEvent *event) override;
     QObject *focusObject() const override;
     void updateQueueDepthAverage(int depth);
-    void updatePendingFrameAge(double age);
+    void updatePendingFrameAge(double age, bool force_notify = false);
     void snapshotLastFrame(AVFrame *frame, double pts, float duration, bool take_ownership = false);
     void clearSnapshotFrame();
     bool hasBufferedWork();
@@ -334,6 +342,23 @@ private:
     uint64_t pending_frame_stored_us = 0;
     mutable QMutex pending_frame_age_mutex;
     bool startup_warmup_preserve_next_session_change = false;
+
+    // Metal backend (macOS). libplacebo still gets an inert dummy GPU so the shared
+    // queue/renderer state stays valid, but it never renders.
+    MetalRenderer *metal_renderer = nullptr;
+    pl_gpu placebo_dummy_gpu = {};
+    std::shared_ptr<MetalFrameSink> metal_sink;
+    QAtomicInteger<int> metal_render_queued = 0;
+    QAtomicInteger<int> metal_retry_armed = 0;
+    QAtomicInteger<int> metal_exposed = 0;
+    bool metal_overlay_ready = false;
+    void submitMetalFrame(ChiakiFfmpegFrame frame, int32_t frames_lost);
+    void requestMetalRender();
+    void metalRender();
+    void updateMetalGeometry();
+    // last time the per-frame stats signals were emitted (throttled to 4 Hz)
+    std::atomic<qint64> queue_depth_signal_us{0};
+    std::atomic<qint64> pending_age_signal_us{0};
 
     pl_cache placebo_cache = {};
     pl_log placebo_log = {};

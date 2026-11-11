@@ -4,8 +4,10 @@
 #include "chiaki/log.h"
 #include "chiaki/time.h"
 #include "streamsession.h"
+#include "metalrenderer.h"
 
 #include <qpa/qplatformnativeinterface.h>
+#include <libplacebo/dummy.h>
 
 #define PL_LIBAV_IMPLEMENTATION 0
 #include <libplacebo/utils/libav.h>
@@ -64,9 +66,31 @@ extern "C" {
 #if defined(Q_OS_MACOS)
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 #endif
 
 Q_LOGGING_CATEGORY(chiakiGui, "chiaki.gui", QtInfoMsg);
+
+// Hand-off point between the decoder's frame thread and the window for the Metal backend.
+// Shared with QmlBackend so a frame that arrives while the window is being destroyed is freed
+// instead of touching a dead window.
+struct MetalFrameSink
+{
+    QMutex mutex;
+    QmlMainWindow *window = nullptr;
+};
+
+// Per-frame stats properties are bound in QML; notifying on every frame dirties the scene and
+// makes the GUI thread sync with the render thread each time, so notify at most 4 times a second
+static bool statsSignalDue(std::atomic<qint64> &last_us)
+{
+    const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+    qint64 prev_us = last_us.load(std::memory_order_relaxed);
+    if (prev_us > 0 && now_us - prev_us < 250000)
+        return false;
+    return last_us.compare_exchange_strong(prev_us, now_us, std::memory_order_relaxed);
+}
 
 class TimedMutexLocker
 {
@@ -2506,7 +2530,7 @@ pl_gpu QmlMainWindow::placeboGpu() const
         return placebo_vulkan->gpu;
     if (placebo_opengl)
         return placebo_opengl->gpu;
-    return nullptr;
+    return placebo_dummy_gpu;
 }
 
 class RenderControl : public QQuickRenderControl
@@ -2556,6 +2580,12 @@ QmlMainWindow::QmlMainWindow(const StreamSessionConnectInfo &connect_info)
 QmlMainWindow::~QmlMainWindow()
 {
     Q_ASSERT(!placebo_swapchain);
+
+    if (metal_sink) {
+        // No more frames from the decoder thread from here on
+        QMutexLocker locker(&metal_sink->mutex);
+        metal_sink->window = nullptr;
+    }
 
     // A normal exit isn't a crash, whether or not Vulkan showed a frame or the queued clear ran
     if (settings && render_backend == RenderBackend::Vulkan) {
@@ -2670,8 +2700,14 @@ QmlMainWindow::~QmlMainWindow()
     if (owns_render_thread)
         delete render_thread->parent();
     delete qml_engine;
+#if defined(Q_OS_MACOS)
+    // Qt Quick is gone; in-flight command buffers own what they still read, so no GPU wait
+    delete metal_renderer;
+    metal_renderer = nullptr;
+#endif
 
-    FILE *file = fopen(qPrintable(shader_cache_path()), "wb");
+    // The Metal backend never compiles libplacebo shaders; leave the Vulkan/OpenGL cache alone
+    FILE *file = render_backend != RenderBackend::Metal ? fopen(qPrintable(shader_cache_path()), "wb") : nullptr;
     if (file) {
         pl_cache_save_file(placebo_cache, file);
         fclose(file);
@@ -2690,6 +2726,8 @@ QmlMainWindow::~QmlMainWindow()
     } else {
         pl_opengl_destroy(&placebo_opengl);
     }
+    if (placebo_dummy_gpu)
+        pl_gpu_dummy_destroy(&placebo_dummy_gpu);
     delete qt_vk_inst;
     delete qt_gl_offscreen_surface;
     delete qt_gl_context;
@@ -2781,6 +2819,9 @@ void QmlMainWindow::requestOverlayUpdate()
 void QmlMainWindow::presentStartupWarmupFrame(unsigned width, unsigned height, bool hdr)
 {
     if (has_video || width == 0 || height == 0)
+        return;
+    // The warmup frame compiles libplacebo shaders ahead of the stream; Metal has none to warm up
+    if (render_backend == RenderBackend::Metal)
         return;
 
     AVFrame *frame = make_startup_warmup_frame(width, height, hdr, render_backend == RenderBackend::OpenGL);
@@ -3013,6 +3054,11 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
                 << "[decode] gui_handoff_outlier_us=" << gui_handoff_us
                 << " pts=" << frame.pts;
         }
+    }
+
+    if (render_backend == RenderBackend::Metal) {
+        submitMetalFrame(frame, frames_lost);
+        return;
     }
 
     dropped_frames_current.fetchAndAddRelaxed(frames_lost);
@@ -3621,17 +3667,23 @@ void QmlMainWindow::updateQueueDepthAverage(int depth)
         next,
         std::memory_order_release,
         std::memory_order_acquire));
-    emit queueDepthAverageChanged();
+    if (statsSignalDue(queue_depth_signal_us))
+        emit queueDepthAverageChanged();
 }
 
-void QmlMainWindow::updatePendingFrameAge(double age)
+void QmlMainWindow::updatePendingFrameAge(double age, bool force_notify)
 {
     double clamped = qMax(age, 0.0);
     {
         QMutexLocker locker(&pending_frame_age_mutex);
         pending_frame_age = clamped;
     }
-    emit pendingFrameAgeChanged();
+    if (force_notify) {
+        pending_age_signal_us.store(static_cast<qint64>(chiaki_time_now_monotonic_us()), std::memory_order_relaxed);
+        emit pendingFrameAgeChanged();
+    } else if (statsSignalDue(pending_age_signal_us)) {
+        emit pendingFrameAgeChanged();
+    }
 }
 
 bool QmlMainWindow::storePendingFrame(ChiakiFfmpegFrame &frame, bool take_ownership, bool synthetic_warmup)
@@ -4836,7 +4888,38 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
 {
     bypass_frame_queue = settings->GetDirectFrameMapping();
     render_backend = settings->GetRenderBackend();
-    setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
+    // Set when Metal couldn't start and this launch uses Vulkan instead (not persisted)
+    bool metal_fallback = false;
+#if defined(Q_OS_MACOS)
+    if (render_backend == RenderBackend::Metal) {
+        QString metal_error;
+        metal_renderer = MetalRenderer::create(&metal_error);
+        if (!metal_renderer) {
+            qCWarning(chiakiGui) << "Metal renderer initialization failed, using Vulkan for this launch:" << metal_error;
+            render_backend = RenderBackend::Vulkan;
+            metal_fallback = true;
+        } else {
+            metal_sink = std::make_shared<MetalFrameSink>();
+            metal_sink->window = this;
+            // Frame Queue and the frame mixer are libplacebo features; Metal always shows the newest frame
+            if (!bypass_frame_queue)
+                qCInfo(chiakiGui) << "Metal renderer: the Frame Queue / frame mixer settings are not supported and are ignored";
+            bypass_frame_queue = true;
+            qCInfo(chiakiGui) << "Metal renderer: render presets, custom libplacebo options and shaders, and display target overrides are not used";
+            // A marker left by an earlier Vulkan launch says nothing about Metal
+            if (settings->GetVulkanStartupPending()) {
+                settings->SetVulkanStartupPending(false);
+                settings->Sync();
+            }
+        }
+    }
+#else
+    if (render_backend == RenderBackend::Metal)
+        render_backend = RenderBackend::Vulkan;
+#endif
+    setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface
+                   : render_backend == RenderBackend::Metal ? QWindow::MetalSurface
+                   : QWindow::OpenGLSurface);
     qparams = {};
     qparams.drift_compensation = 1e-3;
     qparams.interpolation_threshold = 0.01;
@@ -4950,7 +5033,7 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
             goto renderer_backend_ready;
         }
 
-        if (settings->GetVulkanStartupPending()) {
+        if (settings->GetVulkanStartupPending() && !metal_fallback) {
             // The last launch closed before Vulkan showed a frame, which is how a crash inside the
             // Vulkan driver or a third-party Vulkan layer looks; keep OpenGL until switched back
             settings->SetRenderBackend(RenderBackend::OpenGL);
@@ -5082,6 +5165,11 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
         }
 vulkan_setup_done:
         ;
+    } else if (render_backend == RenderBackend::Metal) {
+        // Inert GPU so the libplacebo queue/renderer objects the shared code touches stay valid
+        placebo_dummy_gpu = pl_gpu_dummy_create(placebo_log, nullptr);
+        if (!placebo_dummy_gpu)
+            qFatal("Failed creating libplacebo dummy GPU for the Metal renderer");
     } else {
         if (!initOpenGLBackend())
             qFatal("Failed initializing OpenGL backend");
@@ -5104,7 +5192,7 @@ renderer_backend_ready:
     };
     placebo_cache = pl_cache_create(&cache_params);
     pl_gpu_set_cache(placeboGpu(), placebo_cache);
-    FILE *file = fopen(qPrintable(shader_cache_path()), "rb");
+    FILE *file = render_backend != RenderBackend::Metal ? fopen(qPrintable(shader_cache_path()), "rb") : nullptr;
     if (file) {
         pl_cache_load_file(placebo_cache, file);
         fclose(file);
@@ -5129,11 +5217,21 @@ renderer_backend_ready:
     quick_render = new RenderControl(this);
 
     QQuickWindow::setDefaultAlphaBuffer(true);
-    QQuickWindow::setGraphicsApi(render_backend == RenderBackend::Vulkan ? QSGRendererInterface::Vulkan : QSGRendererInterface::OpenGL);
+    QQuickWindow::setGraphicsApi(render_backend == RenderBackend::Vulkan ? QSGRendererInterface::Vulkan
+                                 : render_backend == RenderBackend::Metal ? QSGRendererInterface::Metal
+                                 : QSGRendererInterface::OpenGL);
     quick_window = new QQuickWindow(quick_render);
     if (render_backend == RenderBackend::Vulkan) {
         quick_window->setVulkanInstance(qt_vk_inst);
         quick_window->setGraphicsDevice(QQuickGraphicsDevice::fromDeviceObjects(placebo_vulkan->phys_device, placebo_vulkan->device, placebo_vulkan->queue_graphics.index));
+#if defined(Q_OS_MACOS)
+    } else if (render_backend == RenderBackend::Metal) {
+        // Qt Quick renders the UI on the renderer's own device and queue, so the UI texture needs
+        // no cross-queue synchronization before it is composited
+        quick_window->setGraphicsDevice(QQuickGraphicsDevice::fromDeviceAndCommandQueue(
+            static_cast<MTLDevice *>(metal_renderer->device()),
+            static_cast<MTLCommandQueue *>(metal_renderer->commandQueue())));
+#endif
     } else {
         quick_window->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(qt_gl_context));
     }
@@ -5178,6 +5276,12 @@ renderer_backend_ready:
                 av_frame_free(&direct_pending_frame);
                 direct_frame_reset.storeRelease(1);
             }
+#if defined(Q_OS_MACOS)
+            if (metal_renderer) {
+                metal_renderer->clearFrames();
+                requestMetalRender();
+            }
+#endif
             {
                 QMutexLocker locker(&placebo_state_mutex);
                 // pl_queue_reset frees the frames a render may still be drawing, so let that render
@@ -5231,7 +5335,7 @@ renderer_backend_ready:
                 QMutexLocker locker(&pending_frame_mutex);
                 clearPendingFrameStateLocked();
             }
-            updatePendingFrameAge(0.0);
+            updatePendingFrameAge(0.0, true);
             if (buffered_pace_thread)
                 buffered_pace_thread->disarm();
             present_pace_timer_rearm.storeRelease(0);
@@ -5290,6 +5394,18 @@ renderer_backend_ready:
 
         quick_render->prepareThread(render_thread);
         quick_render->moveToThread(render_thread);
+#if defined(Q_OS_MACOS)
+        if (render_backend == RenderBackend::Metal) {
+            // Presenting is latency-critical; run it at the same QoS as the main thread
+            QMetaObject::invokeMethod(quick_render, []() {
+                pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            });
+            metal_renderer->on_zero_copy_failure = [this]() {
+                if (backend && backend->zeroCopy())
+                    backend->disableZeroCopy();
+            };
+        }
+#endif
     }
 
     connect(quick_render, &QQuickRenderControl::sceneChanged, this, [this]() {
@@ -5325,9 +5441,11 @@ renderer_backend_ready:
     this->renderparams_opts = pl_options_alloc(this->placebo_log);
     pl_options_reset(this->renderparams_opts, &pl_render_high_quality_params);
     this->renderparams_changed = true;
-    this->fsr_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSR.glsl"));
-    this->fsrcnnx_hook_8 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_8-0-4-1.glsl"));
-    this->fsrcnnx_hook_16 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_16-0-4-1.glsl"));
+    if (render_backend != RenderBackend::Metal) {
+        this->fsr_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSR.glsl"));
+        this->fsrcnnx_hook_8 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_8-0-4-1.glsl"));
+        this->fsrcnnx_hook_16 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_16-0-4-1.glsl"));
+    }
 
 
     switch (settings->GetPlaceboPreset()) {
@@ -5409,6 +5527,22 @@ void QmlMainWindow::fullscreenTime()
 void QmlMainWindow::update()
 {
     Q_ASSERT(QThread::currentThread() == QGuiApplication::instance()->thread());
+
+    if (render_backend == RenderBackend::Metal) {
+        // Video frames reach the render thread without the GUI thread; this path is only for
+        // UI changes. sync() reads the QML items, so the GUI thread still waits for it, but
+        // nothing on that path waits on the GPU.
+#if defined(Q_OS_MACOS)
+        if (quick_need_sync.fetchAndStoreRelaxed(0) != 0) {
+            quick_render->polishItems();
+            QMetaObject::invokeMethod(quick_render, [this]() {
+                MetalRenderer::runInAutoreleasePool([this]() { sync(); });
+            }, Qt::BlockingQueuedConnection);
+        }
+        requestMetalRender();
+#endif
+        return;
+    }
 
     {
         QMutexLocker locker(&render_schedule_mutex);
@@ -5738,7 +5872,8 @@ void QmlMainWindow::processDeferredSwapTask(qint64 submit_begin_us,
     if (submit_begin_local_us >= submit_begin_us)
         logLatencyStats("submit_queue_delay", submit_begin_local_us - submit_begin_us);
 
-    if (present_submit_interval_us > 0) {
+    // Pacing only serves the frame mixer; without it a finished frame is presented right away
+    if (present_submit_interval_us > 0 && schedule_frame_mixer_active.loadAcquire() != 0) {
         const bool backpressure_active = queue_depth_at_submit >= qMax(2, depth_limit - 1) || pending_frame_waiting;
         const double pace_multiplier = pending_overflow_waiting
             ? 0.80
@@ -5889,6 +6024,14 @@ void QmlMainWindow::updateVSync()
         }
     }
 
+#if defined(Q_OS_MACOS)
+    if (render_backend == RenderBackend::Metal) {
+        present_vsync_enabled = settings->GetVSyncEnabled();
+        if (metal_renderer)
+            metal_renderer->setVSync(present_vsync_enabled);
+        return;
+    }
+#endif
     if (render_backend != RenderBackend::Vulkan)
         return;
     armQuickNeedSync("updateVSync");
@@ -6091,6 +6234,27 @@ void QmlMainWindow::resizeSwapchain()
 {
     Q_ASSERT(QThread::currentThread() == render_thread);
 
+#if defined(Q_OS_MACOS)
+    if (render_backend == RenderBackend::Metal) {
+        // The UI is rendered at the drawable's full backing resolution
+        const QSize pixel_size(qRound(width() * devicePixelRatio()), qRound(height() * devicePixelRatio()));
+        if (pixel_size.isEmpty() || (metal_overlay_ready && pixel_size == swapchain_size))
+            return;
+        if (quick_frame)
+            endFrame();
+        void *overlay = metal_renderer ? metal_renderer->ensureOverlayTexture(pixel_size) : nullptr;
+        if (!overlay)
+            return;
+        swapchain_size = pixel_size;
+        MetalRenderer::runInAutoreleasePool([this, overlay, pixel_size]() {
+            quick_window->setRenderTarget(QQuickRenderTarget::fromMetalTexture(static_cast<MTLTexture *>(overlay), pixel_size));
+        });
+        metal_overlay_ready = true;
+        quick_need_render.storeRelaxed(1);
+        return;
+    }
+#endif
+
     if (!placebo_swapchain)
         createSwapchain();
     if (!placebo_swapchain)
@@ -6202,6 +6366,10 @@ void QmlMainWindow::resizeSwapchain()
 void QmlMainWindow::updateSwapchain()
 {
     Q_ASSERT(QThread::currentThread() == QGuiApplication::instance()->thread());
+    if (render_backend == RenderBackend::Metal) {
+        updateMetalGeometry();
+        return;
+    }
     const qint64 update_swapchain_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
 
     quick_item->setSize(size());
@@ -6229,7 +6397,7 @@ void QmlMainWindow::sync()
 {
     Q_ASSERT(QThread::currentThread() == render_thread);
 
-    if (!quick_tex)
+    if (render_backend == RenderBackend::Metal ? !metal_overlay_ready : !quick_tex)
         return;
 
     const qint64 sync_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
@@ -6266,6 +6434,15 @@ void QmlMainWindow::beginFrame()
 {
     if (quick_frame)
         return;
+
+    if (render_backend == RenderBackend::Metal) {
+        // The render target was set when the overlay texture was (re)created
+        if (!metal_overlay_ready)
+            return;
+        quick_frame = true;
+        quick_render->beginFrame();
+        return;
+    }
 
     if (render_backend == RenderBackend::OpenGL) {
         if (!makeOpenGLContextCurrent())
@@ -6364,6 +6541,12 @@ void QmlMainWindow::endFrame()
     if (!quick_frame)
         return;
 
+    if (render_backend == RenderBackend::Metal) {
+        quick_frame = false;
+        quick_render->endFrame();
+        return;
+    }
+
     if (render_backend == RenderBackend::OpenGL) {
         quick_frame = false;
         quick_render->endFrame();
@@ -6453,6 +6636,10 @@ void QmlMainWindow::handleVulkanRendererFallback(const QString &title, const QSt
 void QmlMainWindow::render()
 {
     Q_ASSERT(QThread::currentThread() == render_thread);
+    if (render_backend == RenderBackend::Metal) {
+        metalRender();
+        return;
+    }
     if (vulkan_device_lost.loadAcquire() != 0) {
         QMutexLocker locker(&render_schedule_mutex);
         render_scheduled = false;
@@ -7067,7 +7254,7 @@ void QmlMainWindow::render()
     if (render_entry_us_local > 0 && render_to_start_frame_us >= render_entry_us_local)
         logLatencyStats("render_to_start_frame", render_to_start_frame_us - render_entry_us_local);
     // Submit immediately and let the swapchain / render path enforce pacing.
-    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present) -> bool {
+    auto close_started_frame = [this, timer_owned_playback, mixer_active, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present) -> bool {
         const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         const int queue_depth_now = snapshotQueueDepth();
         if (detailedVerboseTelemetryEnabled()) {
@@ -7118,7 +7305,9 @@ void QmlMainWindow::render()
             deferred_swap_thread &&
             deferred_present_in_flight.loadAcquire() == 0;
         if (!use_deferred_swap) {
-            if (present) {
+            // Pacing only serves the frame mixer; without it the newest frame is submitted at
+            // once instead of being held up to one stream interval on a fixed clock
+            if (present && mixer_active) {
                 const double pace_multiplier = pending_overflow_waiting
                     ? 0.80
                     : (present_backpressure_active.loadAcquire() != 0 ? 0.90 : 1.0);
@@ -7647,6 +7836,149 @@ void QmlMainWindow::render()
 
 }
 
+void QmlMainWindow::presentMetalFrame(const std::shared_ptr<MetalFrameSink> &sink, ChiakiFfmpegFrame frame, int32_t frames_lost)
+{
+    if (sink) {
+        QMutexLocker locker(&sink->mutex);
+        if (sink->window) {
+            sink->window->submitMetalFrame(frame, frames_lost);
+            return;
+        }
+    }
+    av_frame_free(&frame.frame);
+}
+
+void QmlMainWindow::submitMetalFrame(ChiakiFfmpegFrame frame, int32_t frames_lost)
+{
+    dropped_frames_current.fetchAndAddRelaxed(frames_lost);
+    if (!frame.frame)
+        return;
+#if defined(Q_OS_MACOS)
+    if (!metal_renderer) {
+        av_frame_free(&frame.frame);
+        return;
+    }
+    startup_first_real_frame_queued_pending_visibility.storeRelease(1);
+    // Latest frame wins: one that was never shown is dropped for the new one
+    if (metal_renderer->submitFrame(frame.frame))
+        dropped_frames_current.fetchAndAddRelaxed(1);
+    requestMetalRender();
+#else
+    av_frame_free(&frame.frame);
+#endif
+}
+
+void QmlMainWindow::requestMetalRender()
+{
+    // Any thread. Coalesces wake-ups: one queued render picks up everything that arrived before it
+    if (!metal_renderer || !quick_render)
+        return;
+    if (!metal_render_queued.testAndSetAcquire(0, 1))
+        return;
+#if defined(Q_OS_MACOS)
+    QMetaObject::invokeMethod(quick_render, [this]() {
+        MetalRenderer::runInAutoreleasePool([this]() { metalRender(); });
+    }, Qt::QueuedConnection);
+#endif
+}
+
+void QmlMainWindow::updateMetalGeometry()
+{
+#if defined(Q_OS_MACOS)
+    Q_ASSERT(QThread::currentThread() == QGuiApplication::instance()->thread());
+    if (!metal_renderer || !quick_item)
+        return;
+    metal_exposed.storeRelease(isExposed() ? 1 : 0);
+    if (!metal_renderer->attached()) {
+        QString error;
+        present_vsync_enabled = settings->GetVSyncEnabled();
+        if (!metal_renderer->attachToView(reinterpret_cast<void *>(winId()), present_vsync_enabled, &error)) {
+            qCCritical(chiakiGui) << "Failed to attach the Metal renderer to the window:" << error;
+            return;
+        }
+    }
+    const qreal dpr = devicePixelRatio();
+    metal_renderer->setDrawableGeometry(QSize(qRound(width() * dpr), qRound(height() * dpr)), dpr);
+
+    quick_item->setSize(size());
+    quick_window->resize(size());
+    QMetaObject::invokeMethod(quick_render, std::bind(&QmlMainWindow::resizeSwapchain, this), Qt::QueuedConnection);
+    quick_render->polishItems();
+    // sync() reads the QML items, so the GUI thread waits for it as in update()
+    QMetaObject::invokeMethod(quick_render, [this]() {
+        MetalRenderer::runInAutoreleasePool([this]() { sync(); });
+    }, Qt::BlockingQueuedConnection);
+    requestMetalRender();
+#endif
+}
+
+void QmlMainWindow::metalRender()
+{
+#if defined(Q_OS_MACOS)
+    Q_ASSERT(QThread::currentThread() == render_thread);
+    metal_render_queued.storeRelease(0);
+    if (!metal_renderer || !metal_renderer->attached())
+        return;
+    // libplacebo queue resets don't apply; don't let a stale request look like pending work
+    placebo_reset_pending.storeRelaxed(0);
+    // A hidden window gets no drawables; frames stay pending and the next expose shows the newest
+    if (metal_exposed.loadAcquire() == 0)
+        return;
+
+    if (quick_need_render.loadRelaxed() && metal_overlay_ready) {
+        quick_need_render.storeRelaxed(0);
+        if (!quick_frame)
+            beginFrame();
+        if (quick_frame) {
+            quick_render->render();
+            endFrame();
+            metal_renderer->noteOverlayRendered();
+        }
+    }
+
+    const bool arm_startup_visibility = !has_video &&
+        loading_transition_complete.loadAcquire() == 0 &&
+        startup_video_visible_pending.loadAcquire() == 0;
+
+    MetalRenderer::RenderParams params;
+    params.video_mode = static_cast<MetalRenderer::VideoMode>(static_cast<int>(video_mode));
+    params.zoom_factor = zoom_factor;
+    const MetalRenderer::RenderResult result = metal_renderer->render(params);
+
+    if (result.presented) {
+        const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+        last_swap_return_us.storeRelease(now_us);
+        last_present_complete_us.storeRelease(now_us);
+    }
+    if (result.video_presented) {
+        if (arm_startup_visibility)
+            startup_video_visible_pending.storeRelease(1);
+        if (startup_video_visible_pending.loadAcquire() != 0) {
+            const quint64 generation = startup_video_visible_generation.loadAcquire();
+            QMetaObject::invokeMethod(this, [this, generation]() {
+                completeStartupVideoVisibility(generation);
+            }, Qt::QueuedConnection);
+        }
+        if (startup_video_visible_refresh_pending.loadAcquire() != 0) {
+            startup_video_visible_refresh_pending.storeRelease(0);
+            loading_transition_complete.storeRelease(1);
+            QMetaObject::invokeMethod(this, [this]() {
+                emit loadingTransitionCompleteChanged();
+            }, Qt::QueuedConnection);
+        }
+    }
+
+    // Back-pressure (no free command buffer slot or no drawable): try again shortly rather than
+    // blocking this thread
+    if (result.retry && metal_retry_armed.testAndSetRelaxed(0, 1)) {
+        QTimer::singleShot(4, quick_render, [this]() {
+            metal_retry_armed.storeRelaxed(0);
+            requestMetalRender();
+        });
+    }
+#endif
+}
+
 bool QmlMainWindow::handleShortcut(QKeyEvent *event)
 {
     if (event->modifiers() == Qt::NoModifier) {
@@ -7773,6 +8105,10 @@ bool QmlMainWindow::event(QEvent *event)
 
     switch (event->type()) {
     case QEvent::Expose:
+        if (render_backend == RenderBackend::Metal) {
+            // A hidden window can't get drawables; skip rendering instead of waiting on them
+            metal_exposed.storeRelease(isExposed() ? 1 : 0);
+        }
         if (isExposed())
             updateSwapchain();
         else
@@ -7796,6 +8132,11 @@ bool QmlMainWindow::event(QEvent *event)
         if (isExposed())
             updateSwapchain();
         updateStatsOverlayGeometry();
+        break;
+    case QEvent::DevicePixelRatioChange:
+        // Moved to a screen with another backing scale: re-size the drawable and UI texture
+        if (render_backend == RenderBackend::Metal && isExposed())
+            updateSwapchain();
         break;
     default:
         break;

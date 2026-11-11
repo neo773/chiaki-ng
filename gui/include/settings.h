@@ -70,7 +70,9 @@ enum class PlaceboPreset {
 
 enum class RenderBackend {
 	Vulkan,
-	OpenGL
+	OpenGL,
+	// Native Metal renderer, macOS only; read back as Vulkan elsewhere
+	Metal
 };
 
 enum class WindowType {

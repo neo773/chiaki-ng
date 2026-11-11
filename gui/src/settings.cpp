@@ -709,14 +709,24 @@ void Settings::SetPlaceboPreset(PlaceboPreset preset)
 static const QMap<RenderBackend, QString> render_backend_values = {
 	{ RenderBackend::Vulkan, "vulkan" },
 	{ RenderBackend::OpenGL, "opengl" },
+	{ RenderBackend::Metal, "metal" },
 };
 
+#if defined(Q_OS_MACOS)
+static const RenderBackend render_backend_default = RenderBackend::Metal;
+#else
 static const RenderBackend render_backend_default = RenderBackend::Vulkan;
+#endif
 
 RenderBackend Settings::GetRenderBackend() const
 {
 	auto v = settings.value("settings/render_backend", render_backend_values[render_backend_default]).toString();
-	return render_backend_values.key(v, render_backend_default);
+	RenderBackend backend = render_backend_values.key(v, render_backend_default);
+#if !defined(Q_OS_MACOS)
+	if (backend == RenderBackend::Metal)
+		backend = RenderBackend::Vulkan;
+#endif
+	return backend;
 }
 
 void Settings::SetRenderBackend(RenderBackend backend)

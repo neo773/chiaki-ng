@@ -195,7 +195,7 @@ static inline bool frame_has_planes(const AVFrame *frame)
     return frame->data[0] && planes > 0;
 }
 
-static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_renderer)
+static bool frame_can_use_direct_render(const AVFrame *frame, RenderBackend backend)
 {
     if (!frame || !frame->hw_frames_ctx)
         return true;
@@ -205,7 +205,12 @@ static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_re
         return true;
 #ifdef Q_OS_LINUX
     case AV_PIX_FMT_VAAPI:
-        return !use_opengl_renderer;
+        return backend != RenderBackend::OpenGL;
+#endif
+#ifdef Q_OS_MACOS
+    case AV_PIX_FMT_VIDEOTOOLBOX:
+        // The Metal renderer samples the IOSurface-backed CVPixelBuffer directly
+        return backend == RenderBackend::Metal;
 #endif
     default:
         return false;
@@ -450,7 +455,7 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
     refreshPsnToken();
 }
 
-bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer)
+bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, RenderBackend backend)
 {
     if (!frame.frame)
         return false;
@@ -461,7 +466,7 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
     if (!frame.frame->hw_frames_ctx)
         return frame_has_planes(frame.frame);
 
-    const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, use_opengl_renderer);
+    const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, backend);
     if (direct_render)
         return frame_has_planes(frame.frame);
 
@@ -986,10 +991,12 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
                           << "is not currently available, falling back to auto";
         session_info.hw_decoder = "auto";
     }
-    bool use_opengl_renderer = window && window->runtimeRendererBackend() == static_cast<int>(RenderBackend::OpenGL);
+    const RenderBackend runtime_backend = window ? static_cast<RenderBackend>(window->runtimeRendererBackend()) : RenderBackend::Vulkan;
+    bool use_opengl_renderer = runtime_backend == RenderBackend::OpenGL;
+    const bool use_metal_renderer = runtime_backend == RenderBackend::Metal;
     bool prefer_cuda = window && window->nvidiaCard() && availableDecoders.contains("cuda");
     auto fallbackVulkanDecoderForOpenGL = [&]() {
-        if (!use_opengl_renderer || session_info.hw_decoder != "vulkan")
+        if (!(use_opengl_renderer || use_metal_renderer) || session_info.hw_decoder != "vulkan")
             return;
 
         bool fallbackApplied = false;
@@ -1120,7 +1127,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         return;
     }
 
-    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer]() {
+    const std::shared_ptr<MetalFrameSink> metal_sink = use_metal_renderer ? window->metalFrameSink() : nullptr;
+    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, runtime_backend, metal_sink]() {
         ChiakiFfmpegDecoder *decoder = session->GetFfmpegDecoder();
         if (!decoder) {
             qCCritical(chiakiGui) << "Session has no FFmpeg decoder";
@@ -1136,7 +1144,7 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             pending_recovered_frame.storeRelaxed(1);
 
         const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
-        if (!prepareFrameForPresentation(frame, use_opengl_renderer))
+        if (!prepareFrameForPresentation(frame, runtime_backend))
         {
             av_frame_free(&frame.frame);
             return;
@@ -1154,6 +1162,12 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 
         const qint64 delivery_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         QmlMainWindow *target_window = window;
+        if (metal_sink) {
+            // Hand the frame straight to the Metal renderer from this thread; it keeps only the
+            // newest frame and wakes the render thread itself, so the GUI thread is not involved
+            QmlMainWindow::presentMetalFrame(metal_sink, frame, frames_lost);
+            return;
+        }
         QMetaObject::invokeMethod(target_window, [target_window, frame, frames_lost, delivery_us]() mutable {
             target_window->presentFrame(frame, frames_lost, delivery_us);
         });

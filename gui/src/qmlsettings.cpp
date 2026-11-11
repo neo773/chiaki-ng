@@ -673,8 +673,9 @@ int QmlSettings::rendererBackend() const
 
 void QmlSettings::setRendererBackend(int backend)
 {
+    const RenderBackend max_backend = metalRendererAvailable() ? RenderBackend::Metal : RenderBackend::OpenGL;
     if (backend < static_cast<int>(RenderBackend::Vulkan) ||
-        backend > static_cast<int>(RenderBackend::OpenGL)) {
+        backend > static_cast<int>(max_backend)) {
         qWarning() << "Ignoring invalid renderer backend value:" << backend;
         return;
     }
@@ -685,6 +686,15 @@ void QmlSettings::setRendererBackend(int backend)
 
     settings->SetRenderBackend(next_backend);
     emit rendererBackendChanged();
+}
+
+bool QmlSettings::metalRendererAvailable() const
+{
+#if defined(Q_OS_MACOS)
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool QmlSettings::restartApplication()

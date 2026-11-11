@@ -148,6 +148,10 @@ if(NOT CHIAKI_ENABLE_FFMPEG_DECODER)
 endif()
 if(APPLE)
 	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit")
+	# Native Metal renderer
+	target_sources(chiaki PRIVATE include/metalrenderer.h src/metalrenderer.mm)
+	set_source_files_properties(src/metalrenderer.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+	target_link_libraries(chiaki "-framework Metal" "-framework QuartzCore" "-framework CoreVideo" "-framework AppKit")
 endif()
 
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")

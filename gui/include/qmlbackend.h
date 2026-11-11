@@ -171,7 +171,7 @@ public:
     void setIsAppActive();
 
     void profileChanged();
-    bool prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer);
+    bool prepareFrameForPresentation(ChiakiFfmpegFrame &frame, RenderBackend backend);
     void prepareStartupPresentation(bool present_warmup);
     void applyStartupWindowSizing();
 
