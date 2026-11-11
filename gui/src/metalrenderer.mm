@@ -253,6 +253,7 @@ struct GpuStats {
     ChiakiLatencyStats render{}; // submitFrame -> command buffer commit
     ChiakiLatencyStats display{}; // commit -> on glass (presentedTime)
     ChiakiLatencyStats total{}; // first network packet -> on glass
+    ChiakiLatencyStats decoded_to_glass{}; // decoder output -> on glass (everything after decode)
     std::atomic<uint32_t> dropped_before_display{0}; // superseded by a newer frame before render
     std::atomic<uint32_t> not_presented{0}; // rendered, but the drawable was never shown
 };
@@ -849,22 +850,24 @@ struct MetalRenderer::Private {
         if (now - last_latency_log_s < CHIAKI_LATENCY_STATS_INTERVAL_US / 1e6)
             return;
         last_latency_log_s = now;
-        ChiakiLatencySummary s[4];
+        ChiakiLatencySummary s[5];
         {
             std::lock_guard<std::mutex> locker(stats->latency_mutex);
             s[0] = chiaki_latency_stats_summarize(&stats->handoff);
             s[1] = chiaki_latency_stats_summarize(&stats->render);
             s[2] = chiaki_latency_stats_summarize(&stats->display);
             s[3] = chiaki_latency_stats_summarize(&stats->total);
+            s[4] = chiaki_latency_stats_summarize(&stats->decoded_to_glass);
         }
         const uint32_t dropped = stats->dropped_before_display.exchange(0);
         const uint32_t not_presented = stats->not_presented.exchange(0);
         if (s[2].frames == 0 && dropped == 0 && not_presented == 0)
             return;
         qCInfo(chiakiGui).noquote() << QString::asprintf(
-            "[latency] handoff_ms p50=%.2f p99=%.2f max=%.2f | render_ms p50=%.2f p99=%.2f max=%.2f"
+            "[latency] decoded_to_glass_ms p50=%.2f p99=%.2f max=%.2f | handoff_ms p50=%.2f p99=%.2f max=%.2f | render_ms p50=%.2f p99=%.2f max=%.2f"
             " | display_ms p50=%.2f p99=%.2f max=%.2f | total_ms p50=%.2f p99=%.2f max=%.2f"
             " frames=%u dropped_before_display=%u not_presented=%u",
+            s[4].p50_ms, s[4].p99_ms, s[4].max_ms,
             s[0].p50_ms, s[0].p99_ms, s[0].max_ms, s[1].p50_ms, s[1].p99_ms, s[1].max_ms,
             s[2].p50_ms, s[2].p99_ms, s[2].max_ms, s[3].p50_ms, s[3].p99_ms, s[3].max_ms,
             s[2].frames, dropped, not_presented);
@@ -1453,6 +1456,8 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
                 if (commit_us >= timing.handoff_us)
                     chiaki_latency_stats_add(&stats->render, commit_us - timing.handoff_us);
                 chiaki_latency_stats_add(&stats->display, glass_us >= commit_us ? glass_us - commit_us : 0);
+                if (timing.decoded_us && glass_us >= timing.decoded_us)
+                    chiaki_latency_stats_add(&stats->decoded_to_glass, glass_us - timing.decoded_us);
                 if (timing.first_packet_us && glass_us >= timing.first_packet_us)
                     chiaki_latency_stats_add(&stats->total, glass_us - timing.first_packet_us);
             }];
