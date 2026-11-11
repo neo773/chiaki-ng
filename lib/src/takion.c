@@ -189,6 +189,49 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion);
 static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uint8_t *buf, size_t buf_size);
 static ChiakiErrorCode takion_read_extra_sock_messages(ChiakiTakion *takion);
 
+#ifdef __APPLE__
+// On macOS, a SO_RCVBUF of a_rwnd (100 KiB) is far below the system default
+// (net.inet.udp.recvspace), so a short stall of the receive thread overflows the
+// kernel queue and drops video packets. Request a large buffer instead.
+#define TAKION_APPLE_RCVBUF_SIZE (4 * 1024 * 1024)
+#endif
+
+/**
+ * Set SO_RCVBUF on the Takion socket.
+ * a_rwnd (the window advertised to the console) is not touched.
+ * @return the setsockopt() result of the last attempt (< 0 on failure)
+ */
+static int takion_set_rcvbuf(ChiakiTakion *takion)
+{
+#ifdef __APPLE__
+	int rcvbuf_val = TAKION_APPLE_RCVBUF_SIZE;
+	int r = -1;
+	while(true)
+	{
+		if(rcvbuf_val < (int)takion->a_rwnd)
+			rcvbuf_val = (int)takion->a_rwnd;
+		r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
+		if(r >= 0 || rcvbuf_val <= (int)takion->a_rwnd)
+			break;
+		CHIAKI_LOGV(takion->log, "Takion failed to set SO_RCVBUF to %d: " CHIAKI_SOCKET_ERROR_FMT ", retrying with %d",
+				rcvbuf_val, CHIAKI_SOCKET_ERROR_VALUE, rcvbuf_val / 2);
+		rcvbuf_val /= 2;
+	}
+	if(r < 0)
+		return r;
+	int granted = 0;
+	socklen_t granted_len = sizeof(granted);
+	if(getsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, &granted, &granted_len) == 0)
+		CHIAKI_LOGI(takion->log, "Takion socket receive buffer: requested %d bytes, granted %d bytes", rcvbuf_val, granted);
+	else
+		CHIAKI_LOGI(takion->log, "Takion socket receive buffer: requested %d bytes", rcvbuf_val);
+	return r;
+#else
+	const int rcvbuf_val = takion->a_rwnd;
+	return setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
+#endif
+}
+
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, ChiakiTakionConnectInfo *info, chiaki_socket_t *sock)
 {
 	ChiakiErrorCode ret = CHIAKI_ERR_SUCCESS;
@@ -261,8 +304,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
 			goto error_sock;
 		}
-		const int rcvbuf_val = takion->a_rwnd;
-		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
+		int r = takion_set_rcvbuf(takion);
 		if(r < 0)
 		{
 			CHIAKI_LOGE(takion->log, "Takion failed to setsockopt SO_RCVBUF: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
@@ -349,8 +391,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 			ret = CHIAKI_ERR_NETWORK;
 			goto error_pipe;
 		}
-		const int rcvbuf_val = takion->a_rwnd;
-		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
+		int r = takion_set_rcvbuf(takion);
 		if(r < 0)
 		{
 			CHIAKI_LOGE(takion->log, "Takion failed to setsockopt SO_RCVBUF: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
