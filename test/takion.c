@@ -3,6 +3,7 @@
 #include <munit.h>
 
 #include <chiaki/takion.h>
+#include <chiaki/time.h>
 #include <chiaki/seqnum.h>
 #include <chiaki/base64.h>
 
@@ -326,6 +327,205 @@ static MunitResult test_takion_send_after_receive_error(const MunitParameter par
 #endif
 }
 
+static MunitResult test_stop_pipe_us_and_cancel(const MunitParameter params[], void *user)
+{
+#ifdef _WIN32
+	return MUNIT_SKIP;
+#else
+	ChiakiStopPipe sp;
+	munit_assert_int(chiaki_stop_pipe_init(&sp), ==, CHIAKI_ERR_SUCCESS);
+
+	int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	munit_assert_int(sock, >=, 0);
+	struct sockaddr_in addr = { 0 };
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	munit_assert_int(bind(sock, (struct sockaddr *)&addr, sizeof(addr)), ==, 0);
+	socklen_t addr_len = sizeof(addr);
+	munit_assert_int(getsockname(sock, (struct sockaddr *)&addr, &addr_len), ==, 0);
+
+	// Sub-millisecond / microsecond timeout should return CHIAKI_ERR_TIMEOUT quickly
+	uint64_t t0 = chiaki_time_now_monotonic_us();
+	munit_assert_int(chiaki_stop_pipe_select_single_us(&sp, sock, false, 1500), ==, CHIAKI_ERR_TIMEOUT);
+	uint64_t elapsed = chiaki_time_now_monotonic_us() - t0;
+	munit_assert_uint64(elapsed, <, 50000);
+
+	// Readable socket should return CHIAKI_ERR_SUCCESS immediately
+	uint8_t byte = 0x42;
+	munit_assert_int(sendto(sock, &byte, 1, 0, (struct sockaddr *)&addr, addr_len), ==, 1);
+	munit_assert_int(chiaki_stop_pipe_select_single_us(&sp, sock, false, 100000), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(recv(sock, &byte, 1, 0), ==, 1);
+
+	// Sticky cancel until chiaki_stop_pipe_reset()
+	chiaki_stop_pipe_stop(&sp);
+	munit_assert_int(chiaki_stop_pipe_select_single_us(&sp, sock, false, 100000), ==, CHIAKI_ERR_CANCELED);
+	munit_assert_int(chiaki_stop_pipe_select_single_us(&sp, CHIAKI_INVALID_SOCKET, false, 100000), ==, CHIAKI_ERR_CANCELED);
+
+	munit_assert_int(chiaki_stop_pipe_reset(&sp), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(chiaki_stop_pipe_select_single_us(&sp, sock, false, 500), ==, CHIAKI_ERR_TIMEOUT);
+
+	CHIAKI_SOCKET_CLOSE(sock);
+	chiaki_stop_pipe_fini(&sp);
+	return MUNIT_OK;
+#endif
+}
+
+#ifndef _WIN32
+typedef struct takion_fec_test_t
+{
+	ChiakiTakion takion;
+	ChiakiMutex mutex;
+	ChiakiCond cond;
+	bool connected;
+	size_t av_received;
+	uint16_t packet_indices[16];
+} TakionFecTest;
+
+static void takion_fec_test_cb(ChiakiTakionEvent *event, void *user)
+{
+	TakionFecTest *test = user;
+	chiaki_mutex_lock(&test->mutex);
+	if(event->type == CHIAKI_TAKION_EVENT_TYPE_CONNECTED)
+	{
+		test->connected = true;
+		chiaki_cond_broadcast(&test->cond);
+	}
+	else if(event->type == CHIAKI_TAKION_EVENT_TYPE_AV && event->av && event->av->is_video)
+	{
+		if(test->av_received < 16)
+			test->packet_indices[test->av_received] = event->av->packet_index;
+		test->av_received++;
+		chiaki_cond_broadcast(&test->cond);
+	}
+	chiaki_mutex_unlock(&test->mutex);
+}
+
+static bool takion_fec_test_connected(void *user)
+{
+	return ((TakionFecTest *)user)->connected;
+}
+
+static bool takion_fec_test_got_5(void *user)
+{
+	return ((TakionFecTest *)user)->av_received >= 5;
+}
+
+static void takion_test_format_v12_video(uint8_t *buf, uint16_t pkt_idx, uint16_t frame_idx, uint16_t unit_idx, uint16_t total, uint16_t fec)
+{
+	memset(buf, 0, 1 + CHIAKI_TAKION_V12_AV_HEADER_SIZE_VIDEO + 8);
+	buf[0] = 0x02; // video
+	uint8_t *av = buf + 1;
+	*((chiaki_unaligned_uint16_t *)(av + 0)) = htons(pkt_idx);
+	*((chiaki_unaligned_uint16_t *)(av + 2)) = htons(frame_idx);
+	uint32_t dword_2 = ((uint32_t)(unit_idx & 0x7ff) << 21)
+		| ((uint32_t)((total - 1) & 0x7ff) << 10)
+		| (uint32_t)(fec & 0x3ff);
+	*((chiaki_unaligned_uint32_t *)(av + 4)) = htonl(dword_2);
+	av[8] = 5; // HEVC
+}
+#endif
+
+static MunitResult test_takion_fec_zero_wait_flush(const MunitParameter params[], void *user)
+{
+#ifdef _WIN32
+	return MUNIT_SKIP;
+#else
+	int peer = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	munit_assert_int(peer, >=, 0);
+	struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+	setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	struct sockaddr_in peer_addr = { 0 };
+	peer_addr.sin_family = AF_INET;
+	peer_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	munit_assert_int(bind(peer, (struct sockaddr *)&peer_addr, sizeof(peer_addr)), ==, 0);
+	socklen_t peer_addr_len = sizeof(peer_addr);
+	munit_assert_int(getsockname(peer, (struct sockaddr *)&peer_addr, &peer_addr_len), ==, 0);
+
+	TakionFecTest test = { 0 };
+	munit_assert_int(chiaki_mutex_init(&test.mutex, false), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(chiaki_cond_init(&test.cond), ==, CHIAKI_ERR_SUCCESS);
+
+	ChiakiTakionConnectInfo info = { 0 };
+	info.log = get_test_log();
+	info.sa = (struct sockaddr *)&peer_addr;
+	info.sa_len = sizeof(peer_addr);
+	info.cb = takion_fec_test_cb;
+	info.cb_user = &test;
+	info.enable_crypt = false;
+	info.protocol_version = 12;
+	info.close_socket = true;
+	munit_assert_int(chiaki_takion_connect(&test.takion, &info, NULL), ==, CHIAKI_ERR_SUCCESS);
+
+	uint8_t buf[0x100];
+	struct sockaddr_in client_addr;
+	socklen_t client_addr_len = sizeof(client_addr);
+	ssize_t r = recvfrom(peer, buf, sizeof(buf), 0, (struct sockaddr *)&client_addr, &client_addr_len);
+	munit_assert_int(r, ==, 1 + 0x10 + 0x10);
+	uint32_t tag_local = ntohl(*((chiaki_unaligned_uint32_t *)(buf + 1 + 0x10)));
+
+	uint8_t init_ack[1 + 0x10 + 0x10 + 0x20] = { 0 };
+	takion_test_write_header(init_ack, tag_local, 2, 0x10 + 0x20);
+	uint8_t *pl = init_ack + 1 + 0x10;
+	*((chiaki_unaligned_uint32_t *)(pl + 0)) = htonl(0x2222);
+	*((chiaki_unaligned_uint32_t *)(pl + 4)) = htonl(0x19000);
+	*((chiaki_unaligned_uint16_t *)(pl + 8)) = htons(0x64);
+	*((chiaki_unaligned_uint16_t *)(pl + 0xa)) = htons(0x64);
+	*((chiaki_unaligned_uint32_t *)(pl + 0xc)) = htonl(0x2222);
+	munit_assert_int(sendto(peer, init_ack, sizeof(init_ack), 0, (struct sockaddr *)&client_addr, client_addr_len), ==, sizeof(init_ack));
+
+	r = recvfrom(peer, buf, sizeof(buf), 0, NULL, NULL);
+	munit_assert_int(r, ==, 1 + 0x10 + 0x20);
+
+	uint8_t cookie_ack[1 + 0x10];
+	takion_test_write_header(cookie_ack, tag_local, 0xb, 0);
+	munit_assert_int(sendto(peer, cookie_ack, sizeof(cookie_ack), 0, (struct sockaddr *)&client_addr, client_addr_len), ==, sizeof(cookie_ack));
+
+	chiaki_mutex_lock(&test.mutex);
+	munit_assert_int(chiaki_cond_timedwait_pred(&test.cond, &test.mutex, 5000, takion_fec_test_connected, &test), ==, CHIAKI_ERR_SUCCESS);
+	chiaki_mutex_unlock(&test.mutex);
+
+	/*
+	 * Frame 1: 4 source + 2 FEC = 6 units (pkt 10..15).
+	 * Drop pkt 11 (unit 1) AND drop pkt 15 (trailing unused FEC parity unit 5),
+	 * then send Frame 2 unit 0 (pkt 16). Both frames should flush immediately via
+	 * FEC-aware zero-wait reorder skip without waiting for reorder timeout.
+	 */
+	uint8_t vpkt[1 + CHIAKI_TAKION_V12_AV_HEADER_SIZE_VIDEO + 8];
+	uint64_t t_send = chiaki_time_now_monotonic_us();
+	takion_test_format_v12_video(vpkt, 10, 1, 0, 6, 2);
+	sendto(peer, vpkt, sizeof(vpkt), 0, (struct sockaddr *)&client_addr, client_addr_len);
+	// Skip pkt 11 (unit 1) -> simulated loss
+	takion_test_format_v12_video(vpkt, 12, 1, 2, 6, 2);
+	sendto(peer, vpkt, sizeof(vpkt), 0, (struct sockaddr *)&client_addr, client_addr_len);
+	takion_test_format_v12_video(vpkt, 13, 1, 3, 6, 2);
+	sendto(peer, vpkt, sizeof(vpkt), 0, (struct sockaddr *)&client_addr, client_addr_len);
+	takion_test_format_v12_video(vpkt, 14, 1, 4, 6, 2); // FEC parity makes total received = 4 == source_expected
+	sendto(peer, vpkt, sizeof(vpkt), 0, (struct sockaddr *)&client_addr, client_addr_len);
+	// Skip pkt 15 (trailing unused FEC parity unit 5 of Frame 1)
+	takion_test_format_v12_video(vpkt, 16, 2, 0, 4, 1); // Frame 2 unit 0
+	sendto(peer, vpkt, sizeof(vpkt), 0, (struct sockaddr *)&client_addr, client_addr_len);
+
+	chiaki_mutex_lock(&test.mutex);
+	munit_assert_int(chiaki_cond_timedwait_pred(&test.cond, &test.mutex, 1000, takion_fec_test_got_5, &test), ==, CHIAKI_ERR_SUCCESS);
+	uint64_t fec_flush_us = chiaki_time_now_monotonic_us() - t_send;
+	chiaki_mutex_unlock(&test.mutex);
+
+	munit_assert_uint16(test.packet_indices[0], ==, 10);
+	munit_assert_uint16(test.packet_indices[1], ==, 12);
+	munit_assert_uint16(test.packet_indices[2], ==, 13);
+	munit_assert_uint16(test.packet_indices[3], ==, 14);
+	munit_assert_uint16(test.packet_indices[4], ==, 16);
+	// Should complete in well under reorder timeout (no 2.5ms+ timeout wait needed)
+	munit_assert_uint64(fec_flush_us, <, 2000);
+
+	chiaki_takion_close(&test.takion);
+	CHIAKI_SOCKET_CLOSE(peer);
+	chiaki_cond_fini(&test.cond);
+	chiaki_mutex_fini(&test.mutex);
+	return MUNIT_OK;
+#endif
+}
+
 MunitTest tests_takion[] = {
 	{
 		"/av_packet_parse",
@@ -362,6 +562,22 @@ MunitTest tests_takion[] = {
 	{
 		"/format_congestion",
 		test_takion_format_congestion,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/stop_pipe_us_and_cancel",
+		test_stop_pipe_us_and_cancel,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/fec_zero_wait_flush",
+		test_takion_fec_zero_wait_flush,
 		NULL,
 		NULL,
 		MUNIT_TEST_OPTION_NONE,

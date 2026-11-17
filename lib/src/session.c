@@ -514,8 +514,11 @@ static void *session_thread_func(void *arg)
 
 	chiaki_rpcrypt_init_auth(&session->rpcrypt, session->target, session->nonce, session->connect_info.morning);
 
-	// PS4 doesn't always react right away, sleep a bit
-	chiaki_cond_timedwait_pred(&session->state_cond, &session->state_mutex, 10, session_check_state_pred, session);
+	if(!session->connect_info.ps5)
+	{
+		// PS4 doesn't always react right away, sleep a bit
+		chiaki_cond_timedwait_pred(&session->state_cond, &session->state_mutex, 10, session_check_state_pred, session);
+	}
 
 	CHIAKI_LOGI(session->log, "Starting ctrl");
 
@@ -835,6 +838,7 @@ static ChiakiErrorCode session_thread_request_session(ChiakiSession *session, Ch
 				free(sa);
 				continue;
 			}
+			chiaki_socket_set_low_latency(session_sock, true, false);
 
 			chiaki_mutex_unlock(&session->state_mutex);
 			err = chiaki_stop_pipe_connect(&session->stop_pipe, session_sock, sa, ai->ai_addrlen, 5000);

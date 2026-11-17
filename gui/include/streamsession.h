@@ -44,6 +44,7 @@ class MacAudioOutput;
 #include <QThread>
 #include <QWaitCondition>
 #include <QAtomicInteger>
+#include <functional>
 #if CHIAKI_GUI_ENABLE_SPEEX
 #include <QQueue>
 #include <speex/speex_echo.h>
@@ -265,6 +266,8 @@ class StreamSession : public QObject
 		bool session_started;
 
 		ChiakiFfmpegDecoder *ffmpeg_decoder;
+		QMutex direct_frame_cb_mutex;
+		std::function<bool(ChiakiFfmpegDecoder *)> direct_frame_cb;
 		void TriggerFfmpegFrameAvailable();
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 		ChiakiPiDecoder *pi_decoder;
@@ -403,6 +406,11 @@ class StreamSession : public QObject
 		ChiakiLog *GetChiakiLog()				{ return log.GetChiakiLog(); }
 		QList<Controller *> GetControllers()	{ return controllers.values(); }
 		ChiakiFfmpegDecoder *GetFfmpegDecoder()	{ return ffmpeg_decoder; }
+		void SetDirectFrameCallback(std::function<bool(ChiakiFfmpegDecoder *)> cb)
+		{
+			QMutexLocker locker(&direct_frame_cb_mutex);
+			direct_frame_cb = std::move(cb);
+		}
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 		ChiakiPiDecoder *GetPiDecoder()	{ return pi_decoder; }
 #endif

@@ -44,6 +44,9 @@ typedef struct chiaki_gkcrypt_t {
 	uint8_t key_gmac_base[CHIAKI_GKCRYPT_BLOCK_SIZE];
 	uint8_t key_gmac_current[CHIAKI_GKCRYPT_BLOCK_SIZE];
 	uint64_t key_gmac_index_current;
+	void *gmac_ctx;
+	uint8_t gmac_ctx_key[CHIAKI_GKCRYPT_BLOCK_SIZE];
+	bool gmac_ctx_key_valid;
 	ChiakiLog *log;
 } ChiakiGKCrypt;
 

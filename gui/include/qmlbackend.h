@@ -15,6 +15,7 @@
 #include <QFutureWatcher>
 #include <QFuture>
 #include <QAtomicInteger>
+#include <atomic>
 #ifdef CHIAKI_HAVE_WEBENGINE
 #include <QQuickWebEngineProfile>
 #include <QWebEngineUrlRequestInterceptor>
@@ -177,9 +178,9 @@ public:
 
     void goToSleep();
 
-    bool zeroCopy()        { return !disable_zero_copy; };
-    void disableZeroCopy() { disable_zero_copy = true; };
-    void enableZeroCopy()  { disable_zero_copy = false; };
+    bool zeroCopy()        { return !disable_zero_copy.load(std::memory_order_relaxed); }
+    void disableZeroCopy() { disable_zero_copy.store(true, std::memory_order_relaxed); }
+    void enableZeroCopy()  { disable_zero_copy.store(false, std::memory_order_relaxed); }
 
     Q_INVOKABLE void deleteHost(int index);
     Q_INVOKABLE void wakeUpHost(int index, QString nickname = QString());
@@ -311,7 +312,7 @@ private:
     bool updating_psn_hosts = false;
     QFutureWatcher<void> psn_hosts_watcher;
     QFuture<void> psn_hosts_future;
-    bool disable_zero_copy = false;
+    std::atomic<bool> disable_zero_copy{false};
     QMutex hw_transfer_state_mutex;
     QSet<int> logged_hw_transfer_formats;
     QSet<int> logged_hw_transfer_failures;

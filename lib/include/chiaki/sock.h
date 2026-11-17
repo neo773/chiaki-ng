@@ -35,6 +35,7 @@ typedef int chiaki_socket_t;
 #endif
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_socket_set_nonblock(chiaki_socket_t sock, bool nonblock);
+CHIAKI_EXPORT void chiaki_socket_set_low_latency(chiaki_socket_t sock, bool is_tcp, bool interactive_av);
 
 #ifdef __cplusplus
 }

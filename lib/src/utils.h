@@ -15,7 +15,7 @@
 #include <sys/socket.h>
 #endif
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
 #include <ifaddrs.h>
 #include <string.h>
 #include <errno.h>
@@ -58,8 +58,9 @@ static inline const char *sockaddr_str(struct sockaddr *addr, char *addr_buf, si
 
 static inline int sendto_broadcast(ChiakiLog *log, chiaki_socket_t s, const void *msg, size_t len, int flags, const struct sockaddr *to, socklen_t tolen)
 {
-#ifdef __FreeBSD__
-	// see https://wiki.freebsd.org/NetworkRFCCompliance
+#if defined(__FreeBSD__) || defined(__APPLE__)
+	// Fan out 255.255.255.255 dynamically across all live broadcast interfaces
+	// (including macOS Internet Sharing bridge100 and hot-plugged Ethernet adapters).
 	if(to->sa_family == AF_INET && ((const struct sockaddr_in *)to)->sin_addr.s_addr == htonl(INADDR_BROADCAST))
 	{
 		struct ifaddrs *ifap;
@@ -73,24 +74,29 @@ static inline int sendto_broadcast(ChiakiLog *log, chiaki_socket_t s, const void
 		{
 			if(!a->ifa_broadaddr)
 				continue;
-			if(!(a->ifa_flags & IFF_BROADCAST))
+			if((a->ifa_flags & (IFF_UP | IFF_RUNNING | IFF_BROADCAST)) != (IFF_UP | IFF_RUNNING | IFF_BROADCAST))
 				continue;
-			if(a->ifa_broadaddr->sa_family != to->sa_family)
+			if(a->ifa_flags & IFF_LOOPBACK)
 				continue;
-			((struct sockaddr_in *)a->ifa_broadaddr)->sin_port = ((const struct sockaddr_in *)to)->sin_port;
+			if(a->ifa_broadaddr->sa_family != AF_INET)
+				continue;
+			struct sockaddr_in baddr;
+			memcpy(&baddr, a->ifa_broadaddr, sizeof(baddr));
+			baddr.sin_port = ((const struct sockaddr_in *)to)->sin_port;
 			char addr_buf[64];
-			const char *addr_str = sockaddr_str(a->ifa_broadaddr, addr_buf, sizeof(addr_buf));
+			const char *addr_str = sockaddr_str((struct sockaddr *)&baddr, addr_buf, sizeof(addr_buf));
 			CHIAKI_LOGV(log, "Broadcast to %s on %s", addr_str ? addr_str : "(null)", a->ifa_name);
-			int sr = sendto(s, msg, len, flags, a->ifa_broadaddr, sizeof(*a->ifa_broadaddr));
+			int sr = sendto(s, msg, len, flags, (const struct sockaddr *)&baddr, sizeof(baddr));
 			if(sr < 0)
 			{
-				CHIAKI_LOGE(log, "Broadcast on iface %s failed: %s", a->ifa_name, strerror(errno));
+				CHIAKI_LOGV(log, "Broadcast on iface %s failed: %s", a->ifa_name, strerror(errno));
 				continue;
 			}
 			r = sr;
 		}
 		freeifaddrs(ifap);
-		return r;
+		if(r >= 0)
+			return r;
 	}
 #endif
 	return sendto(s, (CHIAKI_SOCKET_BUF_TYPE) msg, len, flags, to, tolen);
@@ -159,8 +165,34 @@ static inline ChiakiErrorCode chiaki_send_fully(ChiakiStopPipe *stop_pipe, chiak
 	return CHIAKI_ERR_SUCCESS;
 }
 
-static inline void xor_bytes(uint8_t *dst, uint8_t *src, size_t sz)
+static inline void xor_bytes(uint8_t *dst, const uint8_t *src, size_t sz)
 {
+	while(sz >= 16)
+	{
+		uint64_t d0, d1, s0, s1;
+		memcpy(&d0, dst, sizeof(d0));
+		memcpy(&d1, dst + 8, sizeof(d1));
+		memcpy(&s0, src, sizeof(s0));
+		memcpy(&s1, src + 8, sizeof(s1));
+		d0 ^= s0;
+		d1 ^= s1;
+		memcpy(dst, &d0, sizeof(d0));
+		memcpy(dst + 8, &d1, sizeof(d1));
+		dst += 16;
+		src += 16;
+		sz -= 16;
+	}
+	if(sz >= 8)
+	{
+		uint64_t d0, s0;
+		memcpy(&d0, dst, sizeof(d0));
+		memcpy(&s0, src, sizeof(s0));
+		d0 ^= s0;
+		memcpy(dst, &d0, sizeof(d0));
+		dst += 8;
+		src += 8;
+		sz -= 8;
+	}
 	while(sz > 0)
 	{
 		*dst ^= *src;

@@ -52,6 +52,17 @@ extern "C" {
 
 Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
 
+@interface ChiakiProMotionKeepAlive : NSObject
+- (void)onDisplayLink:(CADisplayLink *)link;
+@end
+
+@implementation ChiakiProMotionKeepAlive
+- (void)onDisplayLink:(CADisplayLink *)link
+{
+    (void)link;
+}
+@end
+
 namespace {
 
 constexpr long kMaxCommandBuffersInFlight = 2;
@@ -486,6 +497,43 @@ LayerMode layerModeForFrame(const AVFrame *frame)
     return LayerMode::SDR;
 }
 
+void computeDestRect(double src_w, double src_h, double out_w, double out_h,
+                     const MetalRenderer::RenderParams &params,
+                     double &dst_x, double &dst_y, double &dst_w, double &dst_h)
+{
+    dst_x = 0.0;
+    dst_y = 0.0;
+    dst_w = out_w;
+    dst_h = out_h;
+    switch (params.video_mode) {
+    case MetalRenderer::VideoMode::Stretch:
+        break;
+    case MetalRenderer::VideoMode::Zoom:
+        if (params.zoom_factor == -1.0f) {
+            const double scale = std::max(out_w / src_w, out_h / src_h);
+            dst_w = src_w * scale;
+            dst_h = src_h * scale;
+        } else {
+            // Same as the libplacebo path: native size times 2^zoom, centered
+            const double z = std::pow(2.0, static_cast<double>(params.zoom_factor));
+            dst_w = src_w * z;
+            dst_h = src_h * z;
+        }
+        dst_x = (out_w - dst_w) * 0.5;
+        dst_y = (out_h - dst_h) * 0.5;
+        break;
+    case MetalRenderer::VideoMode::Normal:
+    default: {
+        const double scale = std::min(out_w / src_w, out_h / src_h);
+        dst_w = src_w * scale;
+        dst_h = src_h * scale;
+        dst_x = (out_w - dst_w) * 0.5;
+        dst_y = (out_h - dst_h) * 0.5;
+        break;
+    }
+    }
+}
+
 } // namespace
 
 struct MetalRenderer::Private {
@@ -523,7 +571,11 @@ struct MetalRenderer::Private {
     CVMetalTextureCacheRef texture_cache = nullptr;
 
     // Layer: set once on the GUI thread, then read on the render thread
+    __weak NSView *view = nil;
     __strong CAMetalLayer *layer = nil;
+    __strong ChiakiProMotionKeepAlive *display_link_target = nil;
+    __strong id display_link = nil;
+    bool streaming_active = false;
     std::atomic<bool> attached{false};
     LayerMode layer_mode = LayerMode::SDR;
     uint8_t hdr_display_info[24] = {};
@@ -872,6 +924,8 @@ struct MetalRenderer::Private {
         if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
             ok = mapVideoToolbox(frame, mapped);
             if (!ok) {
+                if (texture_cache)
+                    CVMetalTextureCacheFlush(texture_cache, 0);
                 if (!logged_zero_copy_failure) {
                     logged_zero_copy_failure = true;
                     CVPixelBufferRef pb = reinterpret_cast<CVPixelBufferRef>(frame->data[3]);
@@ -897,8 +951,6 @@ struct MetalRenderer::Private {
             return false;
         }
         current.takeFrom(mapped);
-        if (texture_cache)
-            CVMetalTextureCacheFlush(texture_cache, 0);
         updateHdrMetadata(current.frame);
         return true;
     }
@@ -1045,6 +1097,35 @@ struct MetalRenderer::Private {
             os_signpost_interval_end(signpost_log, timing.signpost, "render");
     }
 
+    // GUI thread: keeps ProMotion displays stepped up to 120 Hz while streaming so scanout
+    // and vblank wait take 8.33 ms instead of 16.67 ms.
+    void updateDisplayLink()
+    {
+        if (@available(macOS 14.0, *)) {
+            NSView *strong_view = view;
+            if (streaming_active && strong_view) {
+                if (!display_link) {
+                    if (!display_link_target)
+                        display_link_target = [ChiakiProMotionKeepAlive new];
+                    CADisplayLink *dl = [strong_view displayLinkWithTarget:display_link_target
+                                                                  selector:@selector(onDisplayLink:)];
+                    if (dl) {
+                        dl.preferredFrameRateRange = CAFrameRateRangeMake(60.0f, 120.0f, 120.0f);
+                        [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+                        display_link = dl;
+                    }
+                }
+                if (display_link)
+                    static_cast<CADisplayLink *>(display_link).paused = NO;
+            } else if (display_link) {
+                CADisplayLink *dl = static_cast<CADisplayLink *>(display_link);
+                dl.paused = YES;
+                [dl invalidate];
+                display_link = nil;
+            }
+        }
+    }
+
     void logLatency()
     {
         const double now = CACurrentMediaTime();
@@ -1085,6 +1166,8 @@ MetalRenderer::MetalRenderer()
 MetalRenderer::~MetalRenderer()
 {
     @autoreleasepool {
+        d->streaming_active = false;
+        d->updateDisplayLink();
         {
             std::lock_guard<std::mutex> locker(d->frame_mutex);
             av_frame_free(&d->pending);
@@ -1140,6 +1223,11 @@ MetalRenderer *MetalRenderer::create(QString *error)
         if (!d->pipelineFor(MTLPixelFormatBGRA8Unorm, &pipeline_error) ||
             !d->pipelineFor(MTLPixelFormatBGR10A2Unorm, &pipeline_error))
             return fail(pipeline_error);
+        if (d->fx_supported) {
+            // Pre-warm YUV->RGB conversion pipelines so Frame 1 with MetalFX never compiles PSOs
+            d->convertPipelineFor(MTLPixelFormatRGBA8Unorm);
+            d->convertPipelineFor(MTLPixelFormatRGBA16Float);
+        }
         d->overlay_check = [d->device newComputePipelineStateWithFunction:check_fn error:&ns_error];
         if (!d->overlay_check)
             return fail(QStringLiteral("Failed to create Metal compute pipeline: %1").arg(QString::fromNSString(ns_error.localizedDescription)));
@@ -1239,9 +1327,11 @@ bool MetalRenderer::attachToView(void *view_ptr, bool vsync, QString *error)
             metal_layer.contentsScale = view.window.backingScaleFactor;
         [CATransaction commit];
 
+        d->view = view;
         d->layer = metal_layer;
         d->layer_mode = LayerMode::SDR;
         d->attached.store(true, std::memory_order_release);
+        d->updateDisplayLink();
         qCInfo(chiakiGui) << "Metal renderer attached, vsync" << vsync;
         return true;
     }
@@ -1274,11 +1364,55 @@ void MetalRenderer::setVSync(bool enabled)
     qCInfo(chiakiGui) << "Metal renderer vsync" << enabled;
 }
 
+void MetalRenderer::setStreamingActive(bool active)
+{
+    @autoreleasepool {
+        if (d->streaming_active == active)
+            return;
+        d->streaming_active = active;
+        d->updateDisplayLink();
+    }
+}
+
 void MetalRenderer::setUpscaler(Upscaler upscaler)
 {
     const int prev = d->upscaler.exchange(static_cast<int>(upscaler), std::memory_order_relaxed);
     if (prev != static_cast<int>(upscaler))
         qCInfo(chiakiGui) << "Metal renderer upscaler:" << upscalerName(upscaler);
+}
+
+void MetalRenderer::warmUpUpscaler(const QSize &source_size, bool hdr, const RenderParams &params)
+{
+    if (!attached() || !d->fx_supported || source_size.isEmpty())
+        return;
+    const auto upscaler = static_cast<Upscaler>(d->upscaler.load(std::memory_order_relaxed));
+    if (upscaler != Upscaler::MetalFX)
+        return;
+    @autoreleasepool {
+        const CGSize drawable_size = d->layer.drawableSize;
+        if (drawable_size.width < 1.0 || drawable_size.height < 1.0)
+            return;
+        const double src_w = static_cast<double>(source_size.width());
+        const double src_h = static_cast<double>(source_size.height());
+        const double out_w = static_cast<double>(drawable_size.width);
+        const double out_h = static_cast<double>(drawable_size.height);
+        double dst_x = 0.0, dst_y = 0.0, dst_w = out_w, dst_h = out_h;
+        computeDestRect(src_w, src_h, out_w, out_h, params, dst_x, dst_y, dst_w, dst_h);
+        const bool magnify = dst_w > src_w * 1.001 || dst_h > src_h * 1.001;
+        if (!magnify)
+            return;
+        const double rw = std::round(dst_w), rh = std::round(dst_h);
+        if (rw > 16384.0 || rh > 16384.0 || rw * rh > 4.0 * out_w * out_h)
+            return;
+        FxConfig cfg;
+        cfg.in_w = static_cast<NSUInteger>(src_w);
+        cfg.in_h = static_cast<NSUInteger>(src_h);
+        cfg.out_w = static_cast<NSUInteger>(rw);
+        cfg.out_h = static_cast<NSUInteger>(rh);
+        cfg.hdr = hdr;
+        cfg.format = hdr ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
+        d->ensureFx(cfg);
+    }
 }
 
 bool MetalRenderer::submitFrame(AVFrame *frame, uint64_t first_packet_us, uint64_t decoded_us)
@@ -1396,6 +1530,8 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
     @autoreleasepool {
         if (d->clear_requested.exchange(false)) {
             d->current.reset();
+            if (d->texture_cache)
+                CVMetalTextureCacheFlush(d->texture_cache, 0);
             if (d->current_fresh)
                 d->endRenderSignpost(d->current_timing);
             d->current_fresh = false;
@@ -1444,20 +1580,8 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
         if (drawable_size.width < 1.0 || drawable_size.height < 1.0)
             return result;
 
-        // Bounded by allowsNextDrawableTimeout (1 s)
-        id<CAMetalDrawable> drawable = [layer nextDrawable];
-        if (!drawable) {
-            d->noteBackpressure("nextDrawable timed out");
-            result.retry = true;
-            return result;
-        }
-        id<MTLTexture> target = drawable.texture;
-        id<MTLRenderPipelineState> pso = d->pipelineFor(target.pixelFormat);
-        if (!pso)
-            return result;
-
-        const double out_w = static_cast<double>(target.width);
-        const double out_h = static_cast<double>(target.height);
+        double out_w = static_cast<double>(drawable_size.width);
+        double out_h = static_cast<double>(drawable_size.height);
 
         ShaderParams sp = {};
         sp.viewport[0] = static_cast<float>(out_w);
@@ -1470,6 +1594,7 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
         MappedFrame &cur = d->current;
         const bool has_video = cur.frame && cur.planes[0] && cur.planes[1];
         bool use_fx = false;
+        double src_w = 0.0, src_h = 0.0;
         ShaderParams convert_sp = {};
         if (has_video) {
             const AVFrame *frame = cur.frame;
@@ -1477,37 +1602,11 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
             const double luma_h = static_cast<double>(cur.planes[0].height);
             const double chroma_w = static_cast<double>(cur.planes[1].width);
             const double chroma_h = static_cast<double>(cur.planes[1].height);
-            const double src_w = frame->width > 0 ? std::min<double>(frame->width, luma_w) : luma_w;
-            const double src_h = frame->height > 0 ? std::min<double>(frame->height, luma_h) : luma_h;
+            src_w = frame->width > 0 ? std::min<double>(frame->width, luma_w) : luma_w;
+            src_h = frame->height > 0 ? std::min<double>(frame->height, luma_h) : luma_h;
 
             double dst_x = 0.0, dst_y = 0.0, dst_w = out_w, dst_h = out_h;
-            switch (params.video_mode) {
-            case VideoMode::Stretch:
-                break;
-            case VideoMode::Zoom:
-                if (params.zoom_factor == -1.0f) {
-                    const double scale = std::max(out_w / src_w, out_h / src_h);
-                    dst_w = src_w * scale;
-                    dst_h = src_h * scale;
-                } else {
-                    // Same as the libplacebo path: native size times 2^zoom, centered
-                    const double z = std::pow(2.0, static_cast<double>(params.zoom_factor));
-                    dst_w = src_w * z;
-                    dst_h = src_h * z;
-                }
-                dst_x = (out_w - dst_w) * 0.5;
-                dst_y = (out_h - dst_h) * 0.5;
-                break;
-            case VideoMode::Normal:
-            default: {
-                const double scale = std::min(out_w / src_w, out_h / src_h);
-                dst_w = src_w * scale;
-                dst_h = src_h * scale;
-                dst_x = (out_w - dst_w) * 0.5;
-                dst_y = (out_h - dst_h) * 0.5;
-                break;
-            }
-            }
+            computeDestRect(src_w, src_h, out_w, out_h, params, dst_x, dst_y, dst_w, dst_h);
 
             sp.dst_rect[0] = static_cast<float>(dst_x);
             sp.dst_rect[1] = static_cast<float>(dst_y);
@@ -1619,13 +1718,17 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
         if (overlay)
             sp.flags |= kFlagOverlay;
 
+        // Encode all offscreen GPU passes (UI alpha check + MetalFX YUV->RGB + spatial upscale)
+        // BEFORE acquiring [layer nextDrawable] so drawable hold time is minimized.
         id<MTLCommandBuffer> cb = [d->queue commandBuffer];
         cb.label = @"chiaki present";
 
         id<MTLBuffer> check_buffer = nil;
         uint32_t check_generation = 0;
+        bool consumed_overlay_check = false;
         if (d->overlay_check_pending && d->overlay) {
             d->overlay_check_pending = false;
+            consumed_overlay_check = true;
             check_buffer = [d->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
             if (check_buffer) {
                 std::memset(check_buffer.contents, 0, sizeof(uint32_t));
@@ -1659,6 +1762,41 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
                 [scaler encodeToCommandBuffer:cb];
                 // Recreating the scaler mustn't free what this command buffer still runs
                 hold_fx = d->fx_scaler;
+            }
+        }
+
+        // Bounded by allowsNextDrawableTimeout (1 s)
+        id<CAMetalDrawable> drawable = [layer nextDrawable];
+        if (!drawable) {
+            if (consumed_overlay_check)
+                d->overlay_check_pending = true;
+            d->noteBackpressure("nextDrawable timed out");
+            result.retry = true;
+            return result;
+        }
+        id<MTLTexture> target = drawable.texture;
+        id<MTLRenderPipelineState> pso = d->pipelineFor(target.pixelFormat);
+        if (!pso) {
+            if (consumed_overlay_check)
+                d->overlay_check_pending = true;
+            return result;
+        }
+        const double target_w = static_cast<double>(target.width);
+        const double target_h = static_cast<double>(target.height);
+        if (target_w != out_w || target_h != out_h) {
+            out_w = target_w;
+            out_h = target_h;
+            sp.viewport[0] = static_cast<float>(out_w);
+            sp.viewport[1] = static_cast<float>(out_h);
+            sp.viewport[2] = static_cast<float>(1.0 / out_w);
+            sp.viewport[3] = static_cast<float>(1.0 / out_h);
+            if (has_video) {
+                double dst_x = 0.0, dst_y = 0.0, dst_w = out_w, dst_h = out_h;
+                computeDestRect(src_w, src_h, out_w, out_h, params, dst_x, dst_y, dst_w, dst_h);
+                sp.dst_rect[0] = static_cast<float>(use_fx ? std::round(dst_x) : dst_x);
+                sp.dst_rect[1] = static_cast<float>(use_fx ? std::round(dst_y) : dst_y);
+                sp.dst_rect[2] = static_cast<float>(use_fx ? std::round(dst_w) : dst_w);
+                sp.dst_rect[3] = static_cast<float>(use_fx ? std::round(dst_h) : dst_h);
             }
         }
 

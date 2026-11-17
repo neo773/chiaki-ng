@@ -365,6 +365,14 @@ static ChiakiErrorCode senkusha_run_rtt_test(ChiakiSenkusha *senkusha, uint16_t 
 		rtt_us_acc += delta_us;
 		pings_successful += 1;
 		CHIAKI_LOGI(senkusha->log, "Senkusha received Pong, RTT = %.3f ms", (float)delta_us * 0.001f);
+
+		/*
+		 * Fast-path for wired Ethernet / low-latency LAN: 3 consecutive zero-loss
+		 * pongs averaging < 2.0 ms already establish sub-2ms LAN RTT without waiting
+		 * for 7 additional echo round-trips during session cold start.
+		 */
+		if(pings_successful == 3 && ping_index == 2 && rtt_us_acc < 6000)
+			break;
 	}
 
 	err = senkusha_send_echo_command(senkusha, false);

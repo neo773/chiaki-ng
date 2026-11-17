@@ -212,8 +212,10 @@ static void discovery_service_ping(ChiakiDiscoveryService *service)
 	if(((struct sockaddr *)service->options.send_addr)->sa_family == AF_INET)
 	{
 		((struct sockaddr_in *)service->options.send_addr)->sin_port = htons(CHIAKI_DISCOVERY_PORT_PS4);
+#if !defined(__FreeBSD__) && !defined(__APPLE__)
 		if(((struct sockaddr_in *)service->options.send_addr)->sin_addr.s_addr == 0xffffffff)
 			send_extra_broadcast = true;
+#endif
 	}
 	else if(((struct sockaddr *)service->options.send_addr)->sa_family == AF_INET6)
 		((struct sockaddr_in6 *)service->options.send_addr)->sin6_port = htons(CHIAKI_DISCOVERY_PORT_PS4);

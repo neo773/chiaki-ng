@@ -2820,9 +2820,23 @@ void QmlMainWindow::presentStartupWarmupFrame(unsigned width, unsigned height, b
 {
     if (has_video || width == 0 || height == 0)
         return;
-    // The warmup frame compiles libplacebo shaders ahead of the stream; Metal has none to warm up
-    if (render_backend == RenderBackend::Metal)
+    if (render_backend == RenderBackend::Metal) {
+#if defined(Q_OS_MACOS)
+        if (metal_renderer && quick_render) {
+            MetalRenderer::RenderParams params;
+            params.video_mode = static_cast<MetalRenderer::VideoMode>(static_cast<int>(video_mode));
+            params.zoom_factor = zoom_factor;
+            const QSize src_size(static_cast<int>(width), static_cast<int>(height));
+            QMetaObject::invokeMethod(quick_render, [this, src_size, hdr, params]() {
+                if (metal_renderer)
+                    MetalRenderer::runInAutoreleasePool([this, src_size, hdr, params]() {
+                        metal_renderer->warmUpUpscaler(src_size, hdr, params);
+                    });
+            }, Qt::QueuedConnection);
+        }
+#endif
         return;
+    }
 
     AVFrame *frame = make_startup_warmup_frame(width, height, hdr, render_backend == RenderBackend::OpenGL);
     if (!frame)
@@ -5262,6 +5276,10 @@ renderer_backend_ready:
         startup_warmup_preserve_next_session_change = false;
         session = s;
         stream_session_active.storeRelease(s ? 1 : 0);
+#if defined(Q_OS_MACOS)
+        if (metal_renderer)
+            metal_renderer->setStreamingActive(s != nullptr);
+#endif
         startup_video_visible_generation.fetchAndAddRelaxed(1);
         grab_input = 0;
         if (session)

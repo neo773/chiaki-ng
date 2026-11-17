@@ -67,9 +67,13 @@ public:
     bool attached() const;
     void setDrawableGeometry(const QSize &pixel_size, qreal scale);
     void setVSync(bool enabled);
+    // GUI thread. Locks ProMotion displays to 120 Hz while a stream is active.
+    void setStreamingActive(bool active);
     // Any thread; takes effect with the next render. MetalFX falls back to Standard (logged once)
     // when the GPU or OS doesn't support it.
     void setUpscaler(Upscaler upscaler);
+    // Render thread. Pre-creates the MetalFX upscaler and intermediate textures ahead of Frame 1.
+    void warmUpUpscaler(const QSize &source_size, bool hdr, const RenderParams &params);
 
     // Any thread. Takes ownership of frame. The newest frame wins: returns true when an older
     // frame that was never rendered got dropped for it.

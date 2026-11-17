@@ -23,6 +23,9 @@ typedef struct chiaki_stop_pipe_t
 {
 #ifdef _WIN32
 	WSAEVENT event;
+#elif defined(__APPLE__)
+	int kq;
+	volatile int stopped;
 #elif defined(__SWITCH__)
 	// due to a lack pipe/event/socketpair
 	// on switch env, we use a physical socket
@@ -43,6 +46,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stop_pipe_init(ChiakiStopPipe *stop_pipe);
 CHIAKI_EXPORT void chiaki_stop_pipe_fini(ChiakiStopPipe *stop_pipe);
 CHIAKI_EXPORT void chiaki_stop_pipe_stop(ChiakiStopPipe *stop_pipe);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stop_pipe_select_single(ChiakiStopPipe *stop_pipe, chiaki_socket_t fd, bool write, uint64_t timeout_ms);
+CHIAKI_EXPORT ChiakiErrorCode chiaki_stop_pipe_select_single_us(ChiakiStopPipe *stop_pipe, chiaki_socket_t fd, bool write, uint64_t timeout_us);
 /**
  * Like connect(), but can be canceled by the stop pipe. Only makes sense with a non-blocking socket.
  */

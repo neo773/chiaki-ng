@@ -3,6 +3,14 @@
 #include <chiaki/sock.h>
 #include <fcntl.h>
 
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#endif
+
 CHIAKI_EXPORT ChiakiErrorCode chiaki_socket_set_nonblock(chiaki_socket_t sock, bool nonblock)
 {
 #ifdef _WIN32
@@ -18,4 +26,44 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_socket_set_nonblock(chiaki_socket_t sock, b
 		return CHIAKI_ERR_UNKNOWN;
 #endif
 	return CHIAKI_ERR_SUCCESS;
+}
+
+CHIAKI_EXPORT void chiaki_socket_set_low_latency(chiaki_socket_t sock, bool is_tcp, bool interactive_av)
+{
+	if(CHIAKI_SOCKET_IS_INVALID(sock))
+		return;
+
+	if(is_tcp)
+	{
+		int nodelay = 1;
+		setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
+	}
+
+#ifdef __APPLE__
+	int nosigpipe = 1;
+	setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+
+#ifdef SO_NET_SERVICE_TYPE
+	/*
+	 * Prioritize Remote Play packets in XNU's FQ-CoDel / interface scheduler
+	 * (including bridge100 Internet Sharing, Ethernet, and Wi-Fi WMM queues).
+	 */
+	int svc_type = interactive_av ? NET_SERVICE_TYPE_RV : NET_SERVICE_TYPE_SIG;
+	setsockopt(sock, SOL_SOCKET, SO_NET_SERVICE_TYPE, &svc_type, sizeof(svc_type));
+#endif
+
+	if(!is_tcp && interactive_av)
+	{
+		int sndbuf = 0;
+		socklen_t optlen = sizeof(sndbuf);
+		const int min_sndbuf = 512 * 1024;
+		if(getsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) != 0 || sndbuf < min_sndbuf)
+		{
+			sndbuf = min_sndbuf;
+			setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+		}
+	}
+#else
+	(void)interactive_av;
+#endif
 }

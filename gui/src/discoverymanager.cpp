@@ -170,6 +170,8 @@ void DiscoveryManager::SetActive(bool active)
 				switch (current_addr->ifa_addr->sa_family)
 				{
 					case AF_INET:
+						if (current_addr->ifa_broadaddr == NULL)
+							continue;
 						res4 = (struct sockaddr_in *)current_addr->ifa_broadaddr;
 						if(!broadcast_addresses.contains(res4->sin_addr.s_addr))
 							broadcast_addresses.append(res4->sin_addr.s_addr);

@@ -378,6 +378,7 @@ static ChiakiErrorCode ctrl_connect_tcp(ChiakiCtrl *ctrl)
 		ctrl_failed(ctrl, CHIAKI_QUIT_REASON_CTRL_UNKNOWN);
 		return err;
 	}
+	chiaki_socket_set_low_latency(sock, true, false);
 
 	chiaki_mutex_unlock(&ctrl->notif_mutex);
 	err = chiaki_stop_pipe_connect(&ctrl->stop_pipe, sock, sa, addr->ai_addrlen, 5000);

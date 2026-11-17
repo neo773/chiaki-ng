@@ -9,6 +9,7 @@
 #include "chiaki/remote/holepunch.h"
 #ifdef Q_OS_MACOS
 #include "macWakeSleep.h"
+#include <pthread/qos.h>
 #elif defined(Q_OS_WINDOWS)
 #include "windowsWakeSleep.h"
 #endif
@@ -306,6 +307,11 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
     frame_thread->setObjectName("frame");
     frame_thread->start();
     frame_obj->moveToThread(frame_thread);
+#ifdef Q_OS_MACOS
+    QMetaObject::invokeMethod(frame_obj, []() {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }, Qt::QueuedConnection);
+#endif
 
     PsnConnectionWorker *worker = new PsnConnectionWorker;
     worker->moveToThread(&psn_connection_thread);
@@ -471,7 +477,7 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, RenderBac
     if (!frame.frame->hw_frames_ctx)
         return frame_has_planes(frame.frame);
 
-    const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, backend);
+    const bool direct_render = !disable_zero_copy.load(std::memory_order_relaxed) && frame_can_use_direct_render(frame.frame, backend);
     if (direct_render)
         return frame_has_planes(frame.frame);
 
@@ -537,8 +543,9 @@ void QmlBackend::teardownSession()
     chiaki_log_ctx = nullptr;
     chiaki_log_mutex.unlock();
 
-    // 1) Stop any new signal deliveries from the session, most importantly the
-    //    frame-thread FfmpegFrameAvailable handler.
+    // 1) Stop any new direct callbacks or signal deliveries from the session, most importantly
+    //    the frame-thread FfmpegFrameAvailable handler.
+    session->SetDirectFrameCallback(nullptr);
     session->disconnect();
 
     // 2) Drain the frame thread's already-queued lambdas. QMetaObject::invoke
@@ -981,7 +988,7 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 
     session_info = connect_info;
     window->setStreamMaxFPS(connect_info.video_profile.max_fps);
-    disable_zero_copy = !settings->GetUseZeroCopy();
+    disable_zero_copy.store(!settings->GetUseZeroCopy(), std::memory_order_relaxed);
     {
         QMutexLocker locker(&hw_transfer_state_mutex);
         logged_hw_transfer_formats.clear();
@@ -1133,6 +1140,47 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
     }
 
     const std::shared_ptr<MetalFrameSink> metal_sink = use_metal_renderer ? window->metalFrameSink() : nullptr;
+#ifdef Q_OS_MACOS
+    if (metal_sink) {
+        // Zero-copy VideoToolbox -> Metal fast path: hand the decoded IOSurface frame straight
+        // from the Chiaki Decoder thread to MetalRenderer without waking QmlBackend::frame_thread.
+        session->SetDirectFrameCallback([this, metal_sink](ChiakiFfmpegDecoder *decoder) -> bool {
+            if (disable_zero_copy.load(std::memory_order_relaxed))
+                return false;
+            int32_t frames_lost = 0;
+            ChiakiFfmpegFrame frame = chiaki_ffmpeg_decoder_pull_frame(decoder, &frames_lost);
+            if (!frame.frame)
+                return true;
+            if (frame.frame->format == AV_PIX_FMT_VIDEOTOOLBOX && frame.frame->hw_frames_ctx) {
+                logDecoderDeliveryStats(static_cast<qint64>(chiaki_time_now_monotonic_us()), frames_lost, frame.recovered);
+                logDecoderFramePtsStats(static_cast<qint64>(chiaki_time_now_monotonic_us()), frame.pts, frame.duration);
+                if (frame.recovered)
+                    pending_recovered_frame.storeRelaxed(1);
+                if (pending_recovered_frame.fetchAndStoreRelaxed(0) != 0)
+                    frame.recovered = true;
+                QmlMainWindow::presentMetalFrame(metal_sink, frame, frames_lost);
+                return true;
+            }
+            // Software fallback frame: hand off to frame_thread
+            if (QObject *frame_ctx = frame_thread ? frame_thread->parent() : nullptr) {
+                QMetaObject::invokeMethod(frame_ctx, [this, metal_sink, frame, frames_lost]() mutable {
+                    if (frame.recovered)
+                        pending_recovered_frame.storeRelaxed(1);
+                    if (!prepareFrameForPresentation(frame, RenderBackend::Metal)) {
+                        av_frame_free(&frame.frame);
+                        return;
+                    }
+                    if (pending_recovered_frame.fetchAndStoreRelaxed(0) != 0)
+                        frame.recovered = true;
+                    QmlMainWindow::presentMetalFrame(metal_sink, frame, frames_lost);
+                }, Qt::QueuedConnection);
+            } else {
+                av_frame_free(&frame.frame);
+            }
+            return true;
+        });
+    }
+#endif
     connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, runtime_backend, metal_sink]() {
         ChiakiFfmpegDecoder *decoder = session->GetFfmpegDecoder();
         if (!decoder) {

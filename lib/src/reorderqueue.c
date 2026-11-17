@@ -167,8 +167,10 @@ CHIAKI_EXPORT bool chiaki_reorder_queue_peek(ChiakiReorderQueue *queue, uint64_t
 	if(!entry->set)
 		return false;
 
-	*seq_num = seq_num_val;
-	*user = entry->user;
+	if(seq_num)
+		*seq_num = seq_num_val;
+	if(user)
+		*user = entry->user;
 	return true;
 }
 

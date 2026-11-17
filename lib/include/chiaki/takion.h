@@ -157,6 +157,12 @@ typedef struct chiaki_takion_t
 	bool video_queue_initialized;
 	int64_t video_queue_head_wait_start_us;
 	uint64_t video_queue_head_wait_seq_num;
+	bool video_fec_frame_valid;
+	ChiakiSeqNum16 video_fec_frame_index;
+	uint16_t video_fec_units_dispatched;
+	uint16_t video_fec_units_source_expected;
+	struct takion_rx_slot_t *rx_pool;
+	struct takion_rx_slot_t *rx_pool_free;
 	ChiakiTakionSendBuffer send_buffer;
 	/**
 	 * send_buffer only exists from the end of the handshake until the receive loop ends.

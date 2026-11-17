@@ -261,6 +261,10 @@ static bool isLocalAddress(QString host)
             return true;
         else if(host.startsWith("192.168."))
             return true;
+        else if(host.startsWith("169.254."))
+            return true;
+        else if(host.startsWith("127."))
+            return true;
         for (int j = 16; j < 32; j++)
         {
             if(host.startsWith(QString("172.") + QString::number(j) + QString(".")))
@@ -272,6 +276,10 @@ static bool isLocalAddress(QString host)
         if(host.startsWith("FC", Qt::CaseInsensitive))
             return true;
         if(host.startsWith("FD", Qt::CaseInsensitive))
+            return true;
+        if(host.startsWith("FE80:", Qt::CaseInsensitive))
+            return true;
+        if(host == "::1")
             return true;
     }
     return false;
@@ -3071,7 +3079,14 @@ void StreamSession::CancelPsnConnection(bool stop_thread)
 
 void StreamSession::TriggerFfmpegFrameAvailable()
 {
-	emit FfmpegFrameAvailable();
+	bool handled_direct = false;
+	{
+		QMutexLocker locker(&direct_frame_cb_mutex);
+		if(direct_frame_cb && ffmpeg_decoder)
+			handled_direct = direct_frame_cb(ffmpeg_decoder);
+	}
+	if(!handled_direct)
+		emit FfmpegFrameAvailable();
 	if(measured_bitrate != session.stream_connection.measured_bitrate)
 	{
 		measured_bitrate = session.stream_connection.measured_bitrate;

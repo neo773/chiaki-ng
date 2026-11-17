@@ -82,25 +82,33 @@ static uint8_t vt_nal_type(ChiakiVtDecoder *vt, const VtNal *nal)
 static size_t vt_split_nals(const uint8_t *buf, size_t size, VtNal *nals, size_t nals_max)
 {
 	size_t count = 0;
-	size_t i = 0;
 	size_t nal_start = SIZE_MAX;
-	while(i + 3 <= size)
+	if(size < 3)
+		return 0;
+
+	const uint8_t *search = buf + 2;
+	const uint8_t *search_end = buf + size;
+	while(search < search_end)
 	{
-		if(buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)
+		const uint8_t *one = memchr(search, 1, (size_t)(search_end - search));
+		if(!one)
+			break;
+		if(one[-1] == 0 && one[-2] == 0)
 		{
+			size_t sc_pos = (size_t)(one - 2 - buf);
 			if(nal_start != SIZE_MAX && count < nals_max)
 			{
-				size_t end = i;
+				size_t end = sc_pos;
 				while(end > nal_start && buf[end - 1] == 0) // trailing_zero_8bits / 4 byte start code
 					end--;
 				if(end > nal_start)
 					nals[count++] = (VtNal){ buf + nal_start, end - nal_start };
 			}
-			i += 3;
-			nal_start = i;
+			nal_start = (size_t)(one + 1 - buf);
+			search = one + 3;
 			continue;
 		}
-		i++;
+		search = one + 1;
 	}
 	if(nal_start != SIZE_MAX && nal_start < size && count < nals_max)
 	{
@@ -388,6 +396,14 @@ static ChiakiVtDecodeResult vt_session_create(ChiakiVtDecoder *vt)
 	if(status != noErr)
 		CHIAKI_LOGW(vt_log(vt), "VideoToolbox native decoder failed to set RealTime: status %d", (int)status);
 
+	int32_t min_pool_buffers = 8;
+	CFNumberRef min_pool_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &min_pool_buffers);
+	if(min_pool_num)
+	{
+		VTSessionSetProperty(vt->session, kVTDecompressionPropertyKey_OutputPoolRequestedMinimumBufferCount, min_pool_num);
+		CFRelease(min_pool_num);
+	}
+
 	vt->using_hardware = false;
 	CFBooleanRef using_hw = NULL;
 	status = VTSessionCopyProperty(vt->session, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
@@ -477,6 +493,8 @@ static ChiakiVtDecodeResult vt_apply_params(ChiakiVtDecoder *vt)
 	vt->color_range = is_full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
 	vt->display_width = display_width;
 	vt->display_height = display_height;
+	if(dims.width > 0 && dims.height > 0)
+		vt_ensure_frames_ctx(vt, dims.width, dims.height, vt_sw_format(pixel_format));
 	pthread_mutex_unlock(&vt->out_mutex);
 
 	CHIAKI_LOGI(vt_log(vt), "VideoToolbox native decoder configured: %s %s %dx%d, %s, %s range, primaries %s, transfer %s, matrix %s%s",

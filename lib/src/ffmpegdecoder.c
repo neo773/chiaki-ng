@@ -146,6 +146,82 @@ static double chiaki_ffmpeg_decoder_default_frame_duration_us(unsigned int max_f
 	return 1000000.0 / fps;
 }
 
+/**
+ * Open the avcodec context (and its hw_device_ctx if configured) if not already open.
+ * Must be called with decoder->mutex held.
+ */
+static bool ffmpeg_decoder_open_avcodec(ChiakiFfmpegDecoder *decoder)
+{
+	if(decoder->codec_context)
+		return true;
+
+	decoder->codec_context = avcodec_alloc_context3(decoder->av_codec);
+	if(!decoder->codec_context)
+	{
+		CHIAKI_LOGE(decoder->log, "Failed to alloc codec context");
+		return false;
+	}
+
+	const char *hw_decoder_name = decoder->hw_decoder_name_buf[0] ? decoder->hw_decoder_name_buf : NULL;
+	if(hw_decoder_name)
+	{
+		CHIAKI_LOGI(decoder->log, "Trying to use hardware decoder \"%s\"", hw_decoder_name);
+		enum AVHWDeviceType type = av_hwdevice_find_type_by_name(hw_decoder_name);
+		if(type == AV_HWDEVICE_TYPE_NONE)
+		{
+			CHIAKI_LOGE(decoder->log, "Hardware decoder \"%s\" not found", hw_decoder_name);
+			goto fail;
+		}
+
+		for(int i = 0;; i++)
+		{
+			const AVCodecHWConfig *config = avcodec_get_hw_config(decoder->av_codec, i);
+			if(!config)
+			{
+				CHIAKI_LOGE(decoder->log, "avcodec_get_hw_config failed");
+				goto fail;
+			}
+			if(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == type)
+			{
+				decoder->hw_pix_fmt = config->pix_fmt;
+				break;
+			}
+		}
+
+		if(!decoder->hw_device_ctx && av_hwdevice_ctx_create(&decoder->hw_device_ctx, type, NULL, NULL, 0) < 0)
+		{
+			CHIAKI_LOGE(decoder->log, "Failed to create hwdevice context");
+			goto fail;
+		}
+		decoder->codec_context->hw_device_ctx = av_buffer_ref(decoder->hw_device_ctx);
+#ifdef __APPLE__
+		decoder->codec_context->opaque = decoder;
+		decoder->codec_context->get_format = ffmpeg_decoder_get_format;
+#endif
+		CHIAKI_LOGI(decoder->log, "Using hardware decoder \"%s\" with pix_fmt=%s", hw_decoder_name, av_get_pix_fmt_name(decoder->hw_pix_fmt));
+	}
+
+	decoder->codec_context->framerate = decoder->synthetic_framerate;
+	decoder->codec_context->pkt_timebase = decoder->synthetic_time_base;
+	decoder->codec_context->time_base = decoder->synthetic_time_base;
+	// The stream has no B-frames, output every frame as soon as it is decoded
+	decoder->codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+	if(avcodec_open2(decoder->codec_context, decoder->av_codec, NULL) < 0)
+	{
+		CHIAKI_LOGE(decoder->log, "Failed to open codec context");
+		goto fail;
+	}
+	decoder->frame_pkt_timebase = decoder->codec_context->pkt_timebase;
+	decoder->frame_ctx_timebase = decoder->codec_context->time_base;
+	decoder->frame_framerate = decoder->codec_context->framerate;
+	return true;
+
+fail:
+	avcodec_free_context(&decoder->codec_context);
+	return false;
+}
+
 CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *decoder, ChiakiLog *log,
 		ChiakiCodec codec, unsigned int max_fps, const char *hw_decoder_name, AVBufferRef *hw_device_ctx,
 		ChiakiFfmpegFrameAvailable frame_available_cb, void *frame_available_cb_user)
@@ -204,8 +280,16 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 	decoder->synthetic_last_sample_time_us = 0;
 	decoder->synthetic_candidate_count = 0;
 
+	decoder->codec_context = NULL;
 	decoder->hw_device_ctx = hw_device_ctx ? av_buffer_ref(hw_device_ctx) : NULL;
 	decoder->hw_pix_fmt = AV_PIX_FMT_NONE;
+	memset(decoder->hw_decoder_name_buf, 0, sizeof(decoder->hw_decoder_name_buf));
+	if(hw_decoder_name)
+		snprintf(decoder->hw_decoder_name_buf, sizeof(decoder->hw_decoder_name_buf), "%s", hw_decoder_name);
+
+	decoder->frame_pkt_timebase = decoder->synthetic_time_base;
+	decoder->frame_ctx_timebase = decoder->synthetic_time_base;
+	decoder->frame_framerate = decoder->synthetic_framerate;
 
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 10, 100)
 	avcodec_register_all();
@@ -217,70 +301,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 		CHIAKI_LOGE(log, "%s Codec not available", chiaki_codec_name(codec));
 		goto error_mutex;
 	}
-
-	decoder->codec_context = avcodec_alloc_context3(decoder->av_codec);
-	if(!decoder->codec_context)
-	{
-		CHIAKI_LOGE(log, "Failed to alloc codec context");
-		goto error_mutex;
-	}
-
-	if(hw_decoder_name)
-	{
-		CHIAKI_LOGI(log, "Trying to use hardware decoder \"%s\"", hw_decoder_name);
-		enum AVHWDeviceType type = av_hwdevice_find_type_by_name(hw_decoder_name);
-		if(type == AV_HWDEVICE_TYPE_NONE)
-		{
-			CHIAKI_LOGE(log, "Hardware decoder \"%s\" not found", hw_decoder_name);
-			goto error_codec_context;
-		}
-
-		for(int i = 0;; i++)
-		{
-			const AVCodecHWConfig *config = avcodec_get_hw_config(decoder->av_codec, i);
-			if(!config)
-			{
-				CHIAKI_LOGE(log, "avcodec_get_hw_config failed");
-				goto error_codec_context;
-			}
-			if(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == type)
-			{
-				decoder->hw_pix_fmt = config->pix_fmt;
-				break;
-			}
-		}
-
-		if(!decoder->hw_device_ctx && av_hwdevice_ctx_create(&decoder->hw_device_ctx, type, NULL, NULL, 0) < 0)
-		{
-			CHIAKI_LOGE(log, "Failed to create hwdevice context");
-			goto error_codec_context;
-		}
-		decoder->codec_context->hw_device_ctx = av_buffer_ref(decoder->hw_device_ctx);
-#ifdef __APPLE__
-		decoder->codec_context->opaque = decoder;
-		decoder->codec_context->get_format = ffmpeg_decoder_get_format;
-#endif
-		CHIAKI_LOGI(log, "Using hardware decoder \"%s\" with pix_fmt=%s", hw_decoder_name, av_get_pix_fmt_name(decoder->hw_pix_fmt));
-	}
-
-	decoder->codec_context->framerate = decoder->synthetic_framerate;
-	decoder->codec_context->pkt_timebase = decoder->synthetic_time_base;
-	decoder->codec_context->time_base = decoder->synthetic_time_base;
-	// The stream has no B-frames, output every frame as soon as it is decoded
-	decoder->codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
-
-	if(avcodec_open2(decoder->codec_context, decoder->av_codec, NULL) < 0)
-	{
-		CHIAKI_LOGE(log, "Failed to open codec context");
-		goto error_codec_context;
-	}
-	decoder->frame_pkt_timebase = decoder->codec_context->pkt_timebase;
-	decoder->frame_ctx_timebase = decoder->codec_context->time_base;
-	decoder->frame_framerate = decoder->codec_context->framerate;
 	chiaki_mutex_unlock(&decoder->mutex);
 
 #ifdef CHIAKI_FFMPEG_DECODER_NATIVE_VT
-	// The avcodec context above stays open as the fallback.
+	// Initialize native VideoToolbox directly without opening an unused FFmpeg hwaccel context;
+	// if native VideoToolbox ever fails fatally, ffmpeg_decoder_open_avcodec() opens the fallback on demand.
 	if(hw_decoder_name && strcmp(hw_decoder_name, "videotoolbox") == 0 && ffmpeg_decoder_native_vt_enabled())
 	{
 		decoder->vt_decoder = chiaki_vt_decoder_new(&decoder->log, codec, ffmpeg_decoder_native_vt_async(),
@@ -292,6 +317,14 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 			CHIAKI_LOGE(log, "Native VideoToolbox decoder is not available, falling back to FFmpeg's videotoolbox hwaccel");
 	}
 #endif
+
+	if(!decoder->vt_decoder)
+	{
+		chiaki_mutex_lock(&decoder->mutex);
+		if(!ffmpeg_decoder_open_avcodec(decoder))
+			goto error_codec_context;
+		chiaki_mutex_unlock(&decoder->mutex);
+	}
 
 	err = chiaki_thread_create(&decoder->decode_thread, ffmpeg_decoder_thread_func, decoder);
 	if(err != CHIAKI_ERR_SUCCESS)
@@ -361,36 +394,47 @@ static void ffmpeg_decoder_classify_unit(ChiakiFfmpegDecoder *decoder, const uin
 	bool parameter_sets = false;
 	bool slices = false;
 	*keyframe = false;
-	for(size_t i = 0; i + 3 < buf_size; i++)
+	if(buf_size >= 4)
 	{
-		if(buf[i] != 0 || buf[i + 1] != 0 || buf[i + 2] != 1)
-			continue;
-		uint8_t nal_header = buf[i + 3];
-		if(hevc)
+		const uint8_t *search = buf + 2;
+		const uint8_t *search_end = buf + buf_size - 1;
+		while(search < search_end)
 		{
-			uint8_t nal_type = (nal_header >> 1) & 0x3f;
-			if(nal_type >= 32 && nal_type <= 34) // VPS, SPS, PPS
-				parameter_sets = true;
-			else if(nal_type < 32)
+			const uint8_t *one = memchr(search, 1, (size_t)(search_end - search));
+			if(!one)
+				break;
+			if(one[-1] != 0 || one[-2] != 0)
 			{
-				slices = true;
-				if(nal_type >= 16 && nal_type <= 21) // BLA, IDR, CRA
-					*keyframe = true;
+				search = one + 1;
+				continue;
 			}
-		}
-		else
-		{
-			uint8_t nal_type = nal_header & 0x1f;
-			if(nal_type == 7 || nal_type == 8) // SPS, PPS
-				parameter_sets = true;
-			else if(nal_type >= 1 && nal_type <= 5)
+			uint8_t nal_header = one[1];
+			if(hevc)
 			{
-				slices = true;
-				if(nal_type == 5) // IDR
-					*keyframe = true;
+				uint8_t nal_type = (nal_header >> 1) & 0x3f;
+				if(nal_type >= 32 && nal_type <= 34) // VPS, SPS, PPS
+					parameter_sets = true;
+				else if(nal_type < 32)
+				{
+					slices = true;
+					if(nal_type >= 16 && nal_type <= 21) // BLA, IDR, CRA
+						*keyframe = true;
+				}
 			}
+			else
+			{
+				uint8_t nal_type = nal_header & 0x1f;
+				if(nal_type == 7 || nal_type == 8) // SPS, PPS
+					parameter_sets = true;
+				else if(nal_type >= 1 && nal_type <= 5)
+				{
+					slices = true;
+					if(nal_type == 5) // IDR
+						*keyframe = true;
+				}
+			}
+			search = one + 4;
 		}
-		i += 3;
 	}
 	*parameter_sets_only = parameter_sets && !slices;
 }
@@ -752,6 +796,15 @@ static AVFrame *ffmpeg_decoder_vt_decode_unit(ChiakiFfmpegDecoder *decoder, Chia
 	CHIAKI_LOGE(decoder->log, "Native VideoToolbox decoder failed, falling back to FFmpeg's videotoolbox hwaccel");
 	chiaki_vt_decoder_free(decoder->vt_decoder);
 	decoder->vt_decoder = NULL;
+	chiaki_mutex_lock(&decoder->mutex);
+	bool fallback_open = ffmpeg_decoder_open_avcodec(decoder);
+	chiaki_mutex_unlock(&decoder->mutex);
+	if(!fallback_open)
+	{
+		av_packet_free(&decoder->vt_last_header);
+		*error = true;
+		return NULL;
+	}
 	if(decoder->vt_last_header && !unit->parameter_sets)
 	{
 		// avcodec has not seen the stream header yet
@@ -911,7 +964,7 @@ CHIAKI_EXPORT void chiaki_ffmpeg_frame_get_timing(
 
 CHIAKI_EXPORT enum AVPixelFormat chiaki_ffmpeg_decoder_get_pixel_format(ChiakiFfmpegDecoder *decoder)
 {
-	if (decoder->hw_device_ctx) {
+	if (decoder->vt_decoder || decoder->hw_device_ctx) {
 		return decoder->hdr_enabled
 			? AV_PIX_FMT_P010LE
 			: AV_PIX_FMT_NV12;
