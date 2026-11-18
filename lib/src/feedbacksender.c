@@ -32,6 +32,7 @@ static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, co
 static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, uint8_t event_count, const uint8_t *buf, size_t buf_size);
 static void feedback_sender_flush_history_locked(ChiakiFeedbackSender *feedback_sender);
 static void feedback_sender_record_history(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now);
+static bool controller_state_equals_for_feedback_state(ChiakiControllerState *a, ChiakiControllerState *b);
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_init(ChiakiFeedbackSender *feedback_sender, ChiakiTakion *takion)
 {
@@ -55,6 +56,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_init(ChiakiFeedbackSender *
 	feedback_sender->history_last_seq_num = 0;
 	feedback_sender->history_last_sent_ms = 0;
 	feedback_sender->history_tail_resends = FEEDBACK_HISTORY_TAIL_COUNT;
+	feedback_sender->last_state_sent_ms = 0;
 	ChiakiErrorCode err = chiaki_feedback_history_buffer_init(&feedback_sender->history_buf, FEEDBACK_HISTORY_BUFFER_SIZE);
 	if(err != CHIAKI_ERR_SUCCESS)
 		return err;
@@ -95,6 +97,8 @@ CHIAKI_EXPORT void chiaki_feedback_sender_fini(ChiakiFeedbackSender *feedback_se
 	chiaki_feedback_history_buffer_fini(&feedback_sender->history_buf);
 }
 
+static void feedback_sender_send_state_seq(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, const ChiakiControllerState *state);
+
 CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_set_controller_state(ChiakiFeedbackSender *feedback_sender, ChiakiControllerState *state)
 {
 	ChiakiErrorCode err = chiaki_mutex_lock(&feedback_sender->state_mutex);
@@ -107,13 +111,82 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_set_controller_state(Chiaki
 		return CHIAKI_ERR_SUCCESS;
 	}
 
+	uint64_t now_ms = chiaki_time_now_monotonic_ms();
 	feedback_sender->controller_state = *state;
 	feedback_sender_record_history(feedback_sender, &feedback_sender->controller_state_history_prev, &feedback_sender->controller_state);
 	feedback_sender->controller_state_history_prev = feedback_sender->controller_state;
-	feedback_sender->controller_state_changed = true;
+
+	/*
+	 * Zero-hop inline send: transmit all newly generated button/trigger history packets
+	 * and analog stick/gyro state updates immediately on the caller's USER_INTERACTIVE
+	 * input thread instead of waiting on a condition-variable thread wakeup.
+	 */
+	bool send_state_inline = false;
+	bool wake_worker = false;
+	ChiakiControllerState state_to_send;
+	ChiakiSeqNum16 state_seq = 0;
+
+	if(!controller_state_equals_for_feedback_state(&feedback_sender->controller_state, &feedback_sender->controller_state_prev))
+	{
+		if(now_ms - feedback_sender->last_state_sent_ms >= 2)
+		{
+			state_to_send = feedback_sender->controller_state;
+			state_seq = feedback_sender->state_seq_num++;
+			feedback_sender->controller_state_prev = state_to_send;
+			feedback_sender->last_state_sent_ms = now_ms;
+			feedback_sender->controller_state_changed = false;
+			send_state_inline = true;
+		}
+		else
+		{
+			feedback_sender->controller_state_changed = true;
+			wake_worker = true;
+		}
+	}
+
+	uint8_t inline_hist_pkts[4][CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
+	size_t inline_hist_sizes[4];
+	uint8_t inline_hist_counts[4];
+	ChiakiSeqNum16 inline_hist_seqs[4];
+	size_t inline_hist_n = 0;
+
+	while(feedback_sender->history_packet_len > 0 && inline_hist_n < 4)
+	{
+		size_t packet_index = feedback_sender->history_packet_begin;
+		size_t pkt_sz = feedback_sender->history_packet_sizes[packet_index];
+		uint8_t ev_cnt = feedback_sender->history_packet_event_counts[packet_index];
+		ChiakiSeqNum16 seq = feedback_sender->history_packet_seq_nums[packet_index];
+		memcpy(inline_hist_pkts[inline_hist_n], feedback_sender->history_packets[packet_index], pkt_sz);
+		inline_hist_sizes[inline_hist_n] = pkt_sz;
+		inline_hist_counts[inline_hist_n] = ev_cnt;
+		inline_hist_seqs[inline_hist_n] = seq;
+		inline_hist_n++;
+
+		feedback_sender->history_packet_begin = (feedback_sender->history_packet_begin + 1)
+			% CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
+		feedback_sender->history_packet_len--;
+
+		memcpy(feedback_sender->history_last_packet, inline_hist_pkts[inline_hist_n - 1], pkt_sz);
+		feedback_sender->history_last_size = pkt_sz;
+		feedback_sender->history_last_event_count = ev_cnt;
+		feedback_sender->history_last_seq_num = seq;
+		feedback_sender->history_last_sent_ms = now_ms;
+		feedback_sender->history_tail_resends = 0;
+		wake_worker = true; // arm 20ms packet-loss tail resend schedule
+	}
+	if(feedback_sender->history_packet_len > 0)
+		wake_worker = true;
 
 	chiaki_mutex_unlock(&feedback_sender->state_mutex);
-	chiaki_cond_signal(&feedback_sender->state_cond);
+
+	if(send_state_inline)
+		feedback_sender_send_state_seq(feedback_sender, state_seq, &state_to_send);
+
+	for(size_t i = 0; i < inline_hist_n; i++)
+		feedback_sender_send_history_packet(feedback_sender, inline_hist_seqs[i], inline_hist_counts[i], inline_hist_pkts[i], inline_hist_sizes[i]);
+
+	if(wake_worker)
+		chiaki_cond_signal(&feedback_sender->state_cond);
 
 	return CHIAKI_ERR_SUCCESS;
 }
@@ -140,7 +213,7 @@ static bool controller_state_equals_for_feedback_state(ChiakiControllerState *a,
 	return true;
 }
 
-static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state)
+static void feedback_sender_send_state_seq(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, const ChiakiControllerState *state)
 {
 	ChiakiFeedbackState feedback_state;
 	feedback_state.left_x = state->left_x;
@@ -159,9 +232,14 @@ static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, co
 	feedback_state.orient_z = state->orient_z;
 	feedback_state.orient_w = state->orient_w;
 
-	ChiakiErrorCode err = chiaki_takion_send_feedback_state(feedback_sender->takion, feedback_sender->state_seq_num++, &feedback_state);
+	ChiakiErrorCode err = chiaki_takion_send_feedback_state(feedback_sender->takion, seq_num, &feedback_state);
 	if(err != CHIAKI_ERR_SUCCESS)
 		CHIAKI_LOGE(feedback_sender->log, "FeedbackSender failed to send Feedback State");
+}
+
+static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state)
+{
+	feedback_sender_send_state_seq(feedback_sender, feedback_sender->state_seq_num++, state);
 }
 
 static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, uint8_t event_count, const uint8_t *buf, size_t buf_size)
@@ -281,8 +359,11 @@ static void *feedback_sender_thread_func(void *user)
 			break;
 
 		uint64_t now_ms = chiaki_time_now_monotonic_ms();
+		if(feedback_sender->last_state_sent_ms > last_feedback_state_ms)
+			last_feedback_state_ms = feedback_sender->last_state_sent_ms;
 		bool send_feedback_state = now_ms - last_feedback_state_ms >= FEEDBACK_STATE_TIMEOUT_MAX_MS;
 		ChiakiControllerState state_now = feedback_sender->controller_state;
+		ChiakiSeqNum16 worker_state_seq = 0;
 		bool send_feedback_history = false;
 		uint8_t history_buf[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
 		size_t history_buf_size = 0;
@@ -291,7 +372,6 @@ static void *feedback_sender_thread_func(void *user)
 
 		if(feedback_sender->controller_state_changed)
 		{
-			// TODO: FEEDBACK_STATE_TIMEOUT_MIN_MS
 			feedback_sender->controller_state_changed = false;
 			send_feedback_state = true;
 
@@ -299,6 +379,14 @@ static void *feedback_sender_thread_func(void *user)
 			if(controller_state_equals_for_feedback_state(&state_now, &feedback_sender->controller_state_prev))
 				send_feedback_state = false;
 		} // else: timeout
+
+		if(send_feedback_state)
+		{
+			worker_state_seq = feedback_sender->state_seq_num++;
+			feedback_sender->controller_state_prev = state_now;
+			feedback_sender->last_state_sent_ms = now_ms;
+			last_feedback_state_ms = now_ms;
+		}
 
 		if(feedback_sender->history_packet_len > 0)
 		{
@@ -334,7 +422,7 @@ static void *feedback_sender_thread_func(void *user)
 		chiaki_mutex_unlock(&feedback_sender->state_mutex);
 
 		if(send_feedback_state)
-			feedback_sender_send_state(feedback_sender, &state_now);
+			feedback_sender_send_state_seq(feedback_sender, worker_state_seq, &state_now);
 
 		if(send_feedback_history)
 			feedback_sender_send_history_packet(feedback_sender, history_packet_seq_num, history_event_count, history_buf, history_buf_size);
@@ -342,11 +430,6 @@ static void *feedback_sender_thread_func(void *user)
 		err = chiaki_mutex_lock(&feedback_sender->state_mutex);
 		if(err != CHIAKI_ERR_SUCCESS)
 			return NULL;
-		if(send_feedback_state)
-		{
-			feedback_sender->controller_state_prev = state_now;
-			last_feedback_state_ms = chiaki_time_now_monotonic_ms();
-		}
 	}
 
 	chiaki_mutex_unlock(&feedback_sender->state_mutex);

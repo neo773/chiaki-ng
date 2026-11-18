@@ -514,11 +514,9 @@ static void *session_thread_func(void *arg)
 
 	chiaki_rpcrypt_init_auth(&session->rpcrypt, session->target, session->nonce, session->connect_info.morning);
 
-	if(!session->connect_info.ps5)
-	{
-		// PS4 doesn't always react right away, sleep a bit
-		chiaki_cond_timedwait_pred(&session->state_cond, &session->state_mutex, 10, session_check_state_pred, session);
-	}
+	// Over sub-millisecond Gigabit Ethernet, both PS4 and PS5 need a brief settle window
+	// between HTTP 200 on /sess/init and accepting the /sess/ctrl upgrade on port 9295.
+	chiaki_cond_timedwait_pred(&session->state_cond, &session->state_mutex, 20, session_check_state_pred, session);
 
 	CHIAKI_LOGI(session->log, "Starting ctrl");
 

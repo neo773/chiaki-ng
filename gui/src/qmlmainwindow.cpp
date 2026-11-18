@@ -6042,7 +6042,8 @@ void QmlMainWindow::updateMetalUpscaler()
         else
             qCWarning(chiakiGui) << "Ignoring unknown CHIAKI_UPSCALER value" << env;
     }
-    static_assert(static_cast<int>(MetalUpscaler::AppleSR) == static_cast<int>(MetalRenderer::Upscaler::AppleSR),
+    static_assert(static_cast<int>(MetalUpscaler::Standard) == static_cast<int>(MetalRenderer::Upscaler::Standard) &&
+                  static_cast<int>(MetalUpscaler::MetalFX) == static_cast<int>(MetalRenderer::Upscaler::MetalFX),
                   "MetalUpscaler and MetalRenderer::Upscaler must match");
     metal_renderer->setUpscaler(static_cast<MetalRenderer::Upscaler>(static_cast<int>(upscaler)));
 #endif

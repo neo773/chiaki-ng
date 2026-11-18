@@ -80,9 +80,7 @@ enum class MetalUpscaler {
 	// Catmull-Rom
 	Standard,
 	// MetalFX spatial scaler
-	MetalFX,
-	// VideoToolbox super resolution (not offered in the UI yet)
-	AppleSR
+	MetalFX
 };
 
 enum class WindowType {
@@ -398,7 +396,7 @@ class Settings : public QObject
 		MetalUpscaler GetMetalUpscaler() const;
 		void SetMetalUpscaler(MetalUpscaler upscaler);
 		static QString MetalUpscalerName(MetalUpscaler upscaler);
-		// standard / metalfx / apple_sr; false for anything else
+		// standard / metalfx; false for anything else
 		static bool MetalUpscalerFromName(const QString &name, MetalUpscaler *upscaler);
 		// Set while Vulkan starts up and cleared once it has shown a frame, so a launch that
 		// crashed inside the Vulkan driver or a Vulkan layer can be told apart on the next one

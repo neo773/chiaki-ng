@@ -704,7 +704,6 @@ int QmlSettings::metalUpscaler() const
 
 void QmlSettings::setMetalUpscaler(int upscaler)
 {
-    // apple_sr is reserved but not offered yet
     if (upscaler < static_cast<int>(MetalUpscaler::Standard) ||
         upscaler > static_cast<int>(MetalUpscaler::MetalFX)) {
         qWarning() << "Ignoring invalid Metal upscaler value:" << upscaler;

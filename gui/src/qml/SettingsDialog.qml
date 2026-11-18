@@ -1034,7 +1034,7 @@ DialogView {
                     C.ComboBox {
                         Layout.preferredWidth: 400
                         visible: Chiaki.settings.rendererBackend === 2
-                        // Index = setting value; apple_sr (2) isn't offered yet and shows as Standard
+                        // Index = setting value
                         model: [qsTr("Standard (Catmull-Rom)"), qsTr("MetalFX")]
                         currentIndex: Chiaki.settings.metalUpscaler === 1 ? 1 : 0
                         onActivated: (index) => Chiaki.settings.metalUpscaler = index

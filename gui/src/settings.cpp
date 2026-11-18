@@ -742,7 +742,6 @@ void Settings::SetRenderBackend(RenderBackend backend)
 static const QMap<MetalUpscaler, QString> metal_upscaler_values = {
 	{ MetalUpscaler::Standard, "standard" },
 	{ MetalUpscaler::MetalFX, "metalfx" },
-	{ MetalUpscaler::AppleSR, "apple_sr" },
 };
 
 static const MetalUpscaler metal_upscaler_default = MetalUpscaler::MetalFX;

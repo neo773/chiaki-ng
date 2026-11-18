@@ -25,9 +25,7 @@ public:
         // Catmull-Rom luma, bilinear chroma, in the single composite pass
         Standard,
         // YUV -> RGB at source size, then MetalFX spatial upscaling (macOS 13+, Apple GPUs)
-        MetalFX,
-        // Reserved for VideoToolbox super resolution; drawn like Standard until it is wired up
-        AppleSR
+        MetalFX
     };
 
     struct RenderParams {

@@ -1375,7 +1375,7 @@ static ChiakiErrorCode ctrl_connect(ChiakiCtrl *ctrl)
 			ctrl->crypt_counter_local++;
 	}
 
-	bool ctrl_request_retry = false;
+	int ctrl_request_retries = 0;
 	char buf[512];
 	size_t header_size;
 	size_t received_size;
@@ -1391,21 +1391,27 @@ static ChiakiErrorCode ctrl_connect(ChiakiCtrl *ctrl)
 			int sent = send(ctrl->sock, (CHIAKI_SOCKET_BUF_TYPE)send_buf, (size_t)request_len, 0);
 			if(sent < 0)
 			{
-				CHIAKI_LOGE(session->log, "Failed to send ctrl request");
-				goto error;
+				err = CHIAKI_ERR_NETWORK;
 			}
-
-			err = chiaki_recv_http_header(ctrl->sock, buf, sizeof(buf), &header_size, &received_size, &ctrl->stop_pipe, CTRL_EXPECT_TIMEOUT);
+			else
+			{
+				err = chiaki_recv_http_header(ctrl->sock, buf, sizeof(buf), &header_size, &received_size, &ctrl->stop_pipe, CTRL_EXPECT_TIMEOUT);
+			}
 		}
 
-		if(err == CHIAKI_ERR_TIMEOUT && !ctrl_request_retry)
+		if((err == CHIAKI_ERR_TIMEOUT || (!session->rudp && err == CHIAKI_ERR_NETWORK)) && ctrl_request_retries < 3)
 		{
-			CHIAKI_LOGI(session->log, "Initial ctrl startup request timed out, resending ...");
+			ctrl_request_retries++;
+			CHIAKI_LOGI(session->log, "Initial ctrl startup request not ready (%s), retry %d/3 ...", chiaki_error_string(err), ctrl_request_retries);
 			memset(buf, 0, sizeof(buf));
-			ctrl_request_retry = true;
 			if(!session->rudp)
 			{
 				ctrl_disconnect_tcp(ctrl);
+				if(chiaki_stop_pipe_sleep(&ctrl->stop_pipe, 35) == CHIAKI_ERR_CANCELED)
+				{
+					err = CHIAKI_ERR_CANCELED;
+					break;
+				}
 				err = ctrl_connect_tcp(ctrl);
 				if(err != CHIAKI_ERR_SUCCESS)
 					goto error;

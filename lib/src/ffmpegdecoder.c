@@ -778,6 +778,24 @@ static void ffmpeg_decoder_vt_output(AVFrame *frame, void *user)
 static AVFrame *ffmpeg_decoder_vt_decode_unit(ChiakiFfmpegDecoder *decoder, ChiakiFfmpegDecoderUnit *unit,
 		AVRational *pkt_timebase, AVRational *ctx_timebase, AVRational *framerate, bool *error)
 {
+	static int s_dump_checked = 0;
+	static FILE *s_dump_fp = NULL;
+	if(!s_dump_checked)
+	{
+		s_dump_checked = 1;
+		const char *dump_path = getenv("CHIAKI_DUMP_HEVC");
+		if(dump_path && dump_path[0])
+		{
+			s_dump_fp = fopen(dump_path, "wb");
+			if(s_dump_fp)
+				CHIAKI_LOGI(decoder->log, "Dumping raw Annex-B stream to %s", dump_path);
+		}
+	}
+	if(s_dump_fp && unit->packet && unit->packet->data && unit->packet->size > 0)
+	{
+		fwrite(unit->packet->data, 1, (size_t)unit->packet->size, s_dump_fp);
+		fflush(s_dump_fp);
+	}
 	if(unit->parameter_sets)
 	{
 		av_packet_free(&decoder->vt_last_header);

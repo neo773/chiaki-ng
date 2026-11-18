@@ -478,8 +478,6 @@ const char *upscalerName(MetalRenderer::Upscaler upscaler)
     switch (upscaler) {
     case MetalRenderer::Upscaler::MetalFX:
         return "metalfx";
-    case MetalRenderer::Upscaler::AppleSR:
-        return "apple_sr";
     case MetalRenderer::Upscaler::Standard:
     default:
         return "standard";
@@ -555,7 +553,6 @@ struct MetalRenderer::Private {
     bool logged_fx_unsupported = false;
     bool logged_fx_failure = false;
     bool logged_fx_created = false;
-    bool logged_apple_sr = false;
     // id<MTLFXSpatialScaler>, kept as plain id so this file still builds for macOS 12 targets
     __strong id fx_scaler = nil;
     __strong id<MTLTexture> fx_input = nil;
@@ -1099,29 +1096,58 @@ struct MetalRenderer::Private {
 
     // GUI thread: keeps ProMotion displays stepped up to 120 Hz while streaming so scanout
     // and vblank wait take 8.33 ms instead of 16.67 ms.
-    void updateDisplayLink()
+    //
+    // The link is created once per renderer and only paused between sessions, so rapid
+    // reconnects never churn CADisplayLink objects; it is invalidated only on teardown.
+    // Its callback is empty: it exists purely to request the 120 Hz frame rate range.
+    // CHIAKI_PROMOTION=0 turns it off without a rebuild.
+    static bool promotionEnabled()
     {
-        if (@available(macOS 14.0, *)) {
-            NSView *strong_view = view;
-            if (streaming_active && strong_view) {
-                if (!display_link) {
+        static const bool enabled = [] {
+            const char *env = getenv("CHIAKI_PROMOTION");
+            return !(env && env[0] == '0');
+        }();
+        return enabled;
+    }
+
+    void updateDisplayLink(bool teardown = false)
+    {
+        if (![NSThread isMainThread]) {
+            qCWarning(chiakiGui) << "Metal renderer: display link update off the main thread, ignored";
+            return;
+        }
+        @autoreleasepool {
+            CADisplayLink *dl = static_cast<CADisplayLink *>(display_link);
+            if (teardown) {
+                if (dl) {
+                    dl.paused = YES;
+                    [dl invalidate];
+                    display_link = nil;
+                }
+                return;
+            }
+            const bool want = streaming_active && promotionEnabled();
+            if (!want) {
+                if (dl)
+                    dl.paused = YES;
+                return;
+            }
+            if (@available(macOS 14.0, *)) {
+                NSView *strong_view = view;
+                if (!dl && strong_view) {
                     if (!display_link_target)
                         display_link_target = [ChiakiProMotionKeepAlive new];
-                    CADisplayLink *dl = [strong_view displayLinkWithTarget:display_link_target
-                                                                  selector:@selector(onDisplayLink:)];
+                    dl = [strong_view displayLinkWithTarget:display_link_target
+                                                   selector:@selector(onDisplayLink:)];
                     if (dl) {
                         dl.preferredFrameRateRange = CAFrameRateRangeMake(60.0f, 120.0f, 120.0f);
                         [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
                         display_link = dl;
+                        qCInfo(chiakiGui) << "Metal renderer: ProMotion 120 Hz display link on (CHIAKI_PROMOTION=0 to disable)";
                     }
                 }
-                if (display_link)
-                    static_cast<CADisplayLink *>(display_link).paused = NO;
-            } else if (display_link) {
-                CADisplayLink *dl = static_cast<CADisplayLink *>(display_link);
-                dl.paused = YES;
-                [dl invalidate];
-                display_link = nil;
+                if (dl)
+                    dl.paused = NO;
             }
         }
     }
@@ -1167,7 +1193,7 @@ MetalRenderer::~MetalRenderer()
 {
     @autoreleasepool {
         d->streaming_active = false;
-        d->updateDisplayLink();
+        d->updateDisplayLink(true);
         {
             std::lock_guard<std::mutex> locker(d->frame_mutex);
             av_frame_free(&d->pending);
@@ -1672,10 +1698,6 @@ MetalRenderer::RenderResult MetalRenderer::render(const RenderParams &params)
                 sp.flags |= kFlagBicubic;
 
             const auto upscaler = static_cast<Upscaler>(d->upscaler.load(std::memory_order_relaxed));
-            if (upscaler == Upscaler::AppleSR && !d->logged_apple_sr) {
-                d->logged_apple_sr = true;
-                qCInfo(chiakiGui) << "Metal renderer: the apple_sr upscaler isn't available yet; using the standard upscaler";
-            }
             if (upscaler != Upscaler::MetalFX && d->fx_scaler)
                 d->releaseFx();
             if (upscaler == Upscaler::MetalFX && magnify) {

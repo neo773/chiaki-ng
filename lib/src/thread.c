@@ -15,6 +15,9 @@
 
 #ifdef __APPLE__
 #include <pthread/qos.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #endif
 
 #if defined(__ANDROID__)
@@ -193,6 +196,11 @@ CHIAKI_EXPORT void chiaki_thread_set_affinity(ChiakiThreadName name)
 	const char *name_str = thread_name_string(name);
 	if(name_str)
 		pthread_setname_np(name_str);
+
+	// Use safe userspace QOS_CLASS_USER_INTERACTIVE (never Mach Real-Time, which can
+	// starve WindowServer on macOS if a socket loop ever spins).
+	if(name == CHIAKI_THREAD_NAME_TAKION || name == CHIAKI_THREAD_NAME_FEEDBACK || name == CHIAKI_THREAD_NAME_DECODER)
+		pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
 	if(g_affinity_cb)
 		g_affinity_cb(name, g_affinity_cb_user);

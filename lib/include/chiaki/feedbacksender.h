@@ -39,6 +39,7 @@ typedef struct chiaki_feedback_sender_t
 	ChiakiSeqNum16 history_last_seq_num;
 	uint64_t history_last_sent_ms;
 	unsigned int history_tail_resends;
+	uint64_t last_state_sent_ms;
 
 	bool should_stop;
 	ChiakiControllerState controller_state_prev;

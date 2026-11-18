@@ -45,8 +45,9 @@ CHIAKI_EXPORT void chiaki_socket_set_low_latency(chiaki_socket_t sock, bool is_t
 
 #ifdef SO_NET_SERVICE_TYPE
 	/*
-	 * Prioritize Remote Play packets in XNU's FQ-CoDel / interface scheduler
-	 * (including bridge100 Internet Sharing, Ethernet, and Wi-Fi WMM queues).
+	 * Tag outgoing packets so XNU's interface scheduler (and Wi-Fi WMM) queues them
+	 * ahead of bulk traffic: interactive video for stream/feedback UDP, signaling for
+	 * session/ctrl TCP. This only marks packets; best effort, failure is harmless.
 	 */
 	int svc_type = interactive_av ? NET_SERVICE_TYPE_RV : NET_SERVICE_TYPE_SIG;
 	setsockopt(sock, SOL_SOCKET, SO_NET_SERVICE_TYPE, &svc_type, sizeof(svc_type));
